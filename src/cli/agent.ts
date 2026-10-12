@@ -3,6 +3,7 @@ import path from "node:path";
 import { execFile, spawn, exec } from "node:child_process";
 import { promisify } from "node:util";
 import { loadCredentials } from "./auth";
+import { searchLayouts, recommendLayout, composePage } from "@lasso-ai/layout-intelligence";
 
 const execFileAsync = promisify(execFile);
 const execAsync = promisify(exec);
@@ -1056,6 +1057,22 @@ export async function proposeChanges(cwd: string, input: AgentInput, config: Age
   // Detect project structure for instruction
   const structure = detectProjectStructure(cwd);
 
+  // Query layout intelligence for relevant patterns
+  let layoutContext = "";
+  try {
+    const layoutQuery = input.instruction;
+    const relevantLayouts = await searchLayouts(layoutQuery);
+    if (relevantLayouts.length > 0) {
+      layoutContext = `\n\nLAYOUT INTELLIGENCE:
+Based on your request, here are relevant layout patterns you should consider:
+${relevantLayouts.slice(0, 3).map((result) => `- ${result.pattern.name}: ${result.pattern.description}`).join("\n")}
+Use these patterns as inspiration for your implementation. Focus on matching the layout structure, spacing, and composition principles.`;
+    }
+  } catch (error) {
+    // Layout intelligence is optional; continue without it if it fails
+    console.warn("Layout intelligence query failed:", error);
+  }
+
   const instruction = `Selection context:
 ${JSON.stringify(input.element, null, 2)}
 ${JSON.stringify(visualContext, null, 2)}
@@ -1070,7 +1087,7 @@ Previous change history for this selection:
 ${priorChanges}
 
 Relevant source context:
-${context || "No matching source context was found. Ask for a more specific selection rather than inventing a file."}${dragHint}${runtimeErrorHint}
+${context || "No matching source context was found. Ask for a more specific selection rather than inventing a file."}${dragHint}${runtimeErrorHint}${layoutContext}
 
 CRITICAL INSTRUCTIONS:
 0. PROJECT STRUCTURE AWARENESS: This project has specific directory structure. Before creating or moving files, verify the actual structure. Do not assume standard locations.
