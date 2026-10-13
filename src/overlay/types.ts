@@ -4,14 +4,6 @@ export type PendingChange = {
   newString: string;
 };
 
-export type ConflictInfo = {
-  filePath: string;
-  expectedHash: string;
-  actualHash: string;
-  originalContent: string;
-  currentContent: string;
-};
-
 export type TimelineSnapshot = {
   id: string;
   taskId: string;

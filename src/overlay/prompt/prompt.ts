@@ -45,7 +45,6 @@ let agentLogExpanded = false;
 let reviewPanel: HTMLDivElement | null = null;
 let agentPromptPanel: HTMLDivElement | null = null;
 let agentPromptTaskId: string | null = null;
-let conflictPanel: HTMLDivElement | null = null;
 let timelinePanel: HTMLDivElement | null = null;
 
 let modelBtn: HTMLButtonElement | null = null;
@@ -284,33 +283,6 @@ export function buildPrompt(): { prompt: HTMLDivElement; review: HTMLDivElement 
   `;
   dom.shadow.appendChild(rev);
   reviewPanel = rev;
-
-  // Conflict resolution panel
-  const conflict = document.createElement("div");
-  conflict.className = "lasso-conflict";
-  conflict.hidden = true;
-  conflict.innerHTML = `
-    <div class="lasso-conflict-header">
-      <div>
-        <h3 class="lasso-conflict-title">⚠️ Source conflict detected</h3>
-        <p class="lasso-conflict-subtitle">The file(s) have changed since the suggestion was generated.</p>
-      </div>
-      <button class="lasso-conflict-close" type="button" aria-label="Close conflict panel">×</button>
-    </div>
-    <div class="lasso-conflict-files"></div>
-    <div class="lasso-conflict-actions">
-      <button class="lasso-conflict-retry" type="button">Retry with current content</button>
-      <button class="lasso-conflict-rebase" type="button">Rebase changes</button>
-      <button class="lasso-conflict-force" type="button">Force apply</button>
-    </div>
-  `;
-  dom.shadow.appendChild(conflict);
-  conflictPanel = conflict;
-
-  conflict.querySelector<HTMLButtonElement>(".lasso-conflict-close")!.addEventListener("click", closeConflict);
-  conflict.querySelector<HTMLButtonElement>(".lasso-conflict-retry")!.addEventListener("click", () => resolveConflict("retry"));
-  conflict.querySelector<HTMLButtonElement>(".lasso-conflict-rebase")!.addEventListener("click", () => resolveConflict("rebase"));
-  conflict.querySelector<HTMLButtonElement>(".lasso-conflict-force")!.addEventListener("click", () => resolveConflict("force"));
 
   // Timeline/history panel
   const timeline = document.createElement("div");
@@ -1043,7 +1015,6 @@ export function resetAgentState() {
 
 function hideReview(): void {
   if (reviewPanel) reviewPanel.hidden = true;
-  closeConflict(); // Also close conflict panel when review is closed
 }
 
 function resetPromptSession(element: Element | null = state.selected): void {
@@ -1154,62 +1125,6 @@ export function showReview(changes: PendingChange[], summary: string) {
 export function closeReview() {
   hideReview();
   resetAgentState();
-}
-
-export function showConflict(conflicts: ConflictInfo[], message: string) {
-  if (!conflictPanel) return;
-  const subtitle = conflictPanel.querySelector<HTMLParagraphElement>(".lasso-conflict-subtitle");
-  const files = conflictPanel.querySelector<HTMLDivElement>(".lasso-conflict-files");
-  if (!subtitle || !files) return;
-
-  subtitle.textContent = message;
-  files.replaceChildren(
-    ...conflicts.map((conflict) => {
-      const file = document.createElement("div");
-      file.className = "lasso-conflict-file";
-      const name = document.createElement("div");
-      name.className = "lasso-conflict-file-name";
-      name.textContent = conflict.filePath;
-      const details = document.createElement("div");
-      details.className = "lasso-conflict-details";
-      details.innerHTML = `
-        <div class="lasso-conflict-hash">
-          <span>Expected: ${conflict.expectedHash.slice(0, 8)}...</span>
-          <span>Actual: ${conflict.actualHash.slice(0, 8)}...</span>
-        </div>
-      `;
-      file.append(name, details);
-      return file;
-    })
-  );
-
-  conflictPanel.hidden = false;
-  const left = Math.max(12, (window.innerWidth - Math.min(520, window.innerWidth - 24)) / 2);
-  const top = Math.max(12, (window.innerHeight - Math.min(400, window.innerHeight - 24)) / 2);
-  conflictPanel.style.left = `${left}px`;
-  conflictPanel.style.top = `${top}px`;
-}
-
-export function closeConflict() {
-  if (!conflictPanel) return;
-  conflictPanel.hidden = true;
-}
-
-function resolveConflict(action: "retry" | "rebase" | "force") {
-  const taskId = state.promptTaskId;
-  if (!taskId || !state.bridgeSocket || state.bridgeSocket.readyState !== WebSocket.OPEN) return;
-
-  // Get conflicts from the panel (we'd need to store them when showing)
-  // For now, send the action and let the bridge handle it
-  state.bridgeSocket.send(JSON.stringify({
-    type: "resolve_conflict",
-    taskId,
-    action,
-    conflicts: [] // Bridge will re-detect conflicts
-  }));
-
-  closeConflict();
-  closeReview();
 }
 
 export function showTimeline() {

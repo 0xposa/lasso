@@ -259,14 +259,6 @@ export function connectBridge() {
           }
         }
 
-        if (message.type === "conflict_detected" && message.conflicts && message.taskId) {
-          const taskId = message.taskId;
-          if (taskId === state.promptTaskId) {
-            showConflict(message.conflicts, message.message);
-          }
-          void notifyAgent("Conflict detected", message.message);
-        }
-
         if (message.type === "timeline" && message.snapshots) {
           state.timelineSnapshots = message.snapshots;
           showTimeline();
