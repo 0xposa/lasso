@@ -11,6 +11,8 @@ import {
   refreshModelMenu,
   syncModelMenu,
   showAgentPrompt,
+  showConflict,
+  showTimeline,
 } from "../prompt/prompt";
 import { setDragCardStatus, resetDrag } from "../drag/drag";
 import { elementKey } from "../toolbar/select";
@@ -24,7 +26,7 @@ import {
   updateEmptyStateUserName,
   populateModelMenu,
 } from "../commandbar/commandbar";
-import type { GitState, ModelOption, PendingChange } from "../types";
+import type { GitState, ModelOption, PendingChange, ConflictInfo } from "../types";
 
 export function reportRuntimeError(details: string, notifyBridge = true) {
   const clean = details.slice(0, 1200);
@@ -249,7 +251,25 @@ export function connectBridge() {
             if (task) state.changesHistory = task.changesHistory.map((entry) => ({ ...entry, changes: entry.changes.map((change) => ({ ...change })) }));
             state.pendingChanges = [...message.changes];
             showReview(message.changes, message.message);
+          } else if (message.status === "error" || message.status === "stopped") {
+            // Close review panel on error or stopped for the active task
+            if (taskId === state.promptTaskId) {
+              closeReview();
+            }
           }
+        }
+
+        if (message.type === "conflict_detected" && message.conflicts && message.taskId) {
+          const taskId = message.taskId;
+          if (taskId === state.promptTaskId) {
+            showConflict(message.conflicts, message.message);
+          }
+          void notifyAgent("Conflict detected", message.message);
+        }
+
+        if (message.type === "timeline" && message.snapshots) {
+          state.timelineSnapshots = message.snapshots;
+          showTimeline();
         }
 
         if (message.type === "assistant_message" && message.message) {
@@ -310,6 +330,7 @@ export function connectBridge() {
           }
           if (isPromptTask) {
             closeReview();
+            closeConflict(); // Also close conflict panel if open
             resetDrag(false);
             state.pendingChanges = [];
           }

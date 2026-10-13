@@ -4,6 +4,28 @@ export type PendingChange = {
   newString: string;
 };
 
+export type ConflictInfo = {
+  filePath: string;
+  expectedHash: string;
+  actualHash: string;
+  originalContent: string;
+  currentContent: string;
+};
+
+export type TimelineSnapshot = {
+  id: string;
+  taskId: string;
+  summary: string;
+  files: Array<{
+    filePath: string;
+    content: string | null;
+    hash: string;
+    timestamp: string;
+  }>;
+  createdAt: string;
+  parentSnapshotId?: string;
+};
+
 export type BuildValidation = {
   passed: boolean;
   errors: string[];

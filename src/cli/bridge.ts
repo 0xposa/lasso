@@ -10,6 +10,7 @@ import { answerQuestion, detectLocalAgents, proposeChanges, generateCommitMessag
 import type { CollabConfig, WorkspaceConfig, ModelsResponse } from "./project";
 import { resolveLassoApiKey, resolveWorkspaceConfig, fetchModels } from "./project";
 import { serverUrlFrom, loadCredentials } from "./auth";
+import { createSnapshot, restoreSnapshot, detectConflicts, getTimeline, deleteSnapshot, getSnapshotByTaskId, type TimelineSnapshot, type ConflictInfo } from "./snapshot";
 
 export const DEFAULT_BRIDGE_PORT = 3056;
 const execFileAsync = promisify(execFile);
@@ -34,7 +35,11 @@ export type BridgeMessage =
   | { type: "git_push" }
   | { type: "agent_status"; taskId?: string; status: "thinking" | "working" | "review" | "error" | "stopped"; message: string }
   | { type: "transcribe"; requestId: string; audio: string; mimeType?: string; language?: string }
-  | { type: "oneshot"; prompt: string; scope?: "project" | "component"; model?: string; provider?: "anthropic" | "openai" | "google" | "ollama" | "nvidia" | "cli"; messages?: Array<{ role: "user" | "assistant"; content: string }>; taskId?: string; pageContext?: any };
+  | { type: "oneshot"; prompt: string; scope?: "project" | "component"; model?: string; provider?: "anthropic" | "openai" | "google" | "ollama" | "nvidia" | "cli"; messages?: Array<{ role: "user" | "assistant"; content: string }>; taskId?: string; pageContext?: any }
+  | { type: "resolve_conflict"; taskId: string; action: "retry" | "force" | "rebase"; conflicts: ConflictInfo[] }
+  | { type: "restore_snapshot"; snapshotId: string }
+  | { type: "get_timeline" }
+  | { type: "delete_snapshot"; snapshotId: string };
 
 type ModelOption = { id: string; label: string; provider: "anthropic" | "openai" | "google" | "ollama" | "nvidia" | "cli"; locked?: boolean; lockedReason?: string };
 type PageEntry = { name: string; path: string; type: "directory" | "file" };
@@ -53,7 +58,9 @@ export type ServerBridgeMessage =
   | { type: "assistant_message"; taskId?: string; message: string }
   | { type: "applied"; taskId?: string; message: string; validation?: { passed: boolean; errors: string[]; command: string } }
   | { type: "undone"; taskId?: string; message: string }
-  | { type: "transcribe_result"; requestId: string; success: boolean; text?: string; provider?: string; error?: string };
+  | { type: "transcribe_result"; requestId: string; success: boolean; text?: string; provider?: string; error?: string }
+  | { type: "conflict_detected"; taskId: string; conflicts: ConflictInfo[]; message: string }
+  | { type: "timeline"; snapshots: TimelineSnapshot[] };
 
 export async function restartBridge(port = DEFAULT_BRIDGE_PORT): Promise<{ ok: boolean; error?: string }> {
   try {
@@ -511,6 +518,119 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     "";
   const lassoKeyConfigured = Boolean(resolvedLassoKey);
 
+  // Task queue for concurrent execution
+  const MAX_CONCURRENT_TASKS = 3;
+  const taskQueue: Array<{ taskId: string; message: BridgeMessage; config: AgentConfig }> = [];
+  const runningTasks = new Set<string>();
+  const taskPriority = new Map<string, number>(); // Lower number = higher priority
+
+  // Will be set when WebSocket connects
+  let currentSocket: WebSocket | null = null;
+
+  function processTaskQueue(): void {
+    if (runningTasks.size >= MAX_CONCURRENT_TASKS || taskQueue.length === 0 || !currentSocket) return;
+
+    const socket = currentSocket; // Capture non-null reference
+
+    taskQueue.sort((a, b) => {
+      const priorityA = taskPriority.get(a.taskId) ?? 999;
+      const priorityB = taskPriority.get(b.taskId) ?? 999;
+      return priorityA - priorityB;
+    });
+
+    const task = taskQueue.shift();
+    if (!task) return;
+
+    runningTasks.add(task.taskId);
+
+    if (task.message.type === "edit") {
+      const request = task.message as Extract<BridgeMessage, { type: "edit" }>;
+      taskControllers.get(request.taskId)?.abort();
+      const controller = new AbortController();
+      taskControllers.set(request.taskId, controller);
+      if (socket.readyState === socket.OPEN) {
+        socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "working", message: "Working…" }));
+      }
+      void proposeChanges(cwd, request, task.config, controller.signal, (message, detail, level) => {
+        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: level === "error" ? "error" : "working", message, detail }));
+        }
+      }, (prompt) => {
+        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({ type: "agent_prompt", taskId: request.taskId, prompt }));
+        }
+      })
+        .then((proposal) => {
+          if (controller.signal.aborted || socket.readyState !== socket.OPEN) return;
+          if (!proposalMatchesCurrentSource(cwd, proposal.changes)) {
+            const refreshAttempts = reviewRefreshAttempts.get(request.taskId) || 0;
+            const MAX_REFRESH_ATTEMPTS = 3;
+            if (refreshAttempts < MAX_REFRESH_ATTEMPTS) {
+              reviewRefreshAttempts.set(request.taskId, refreshAttempts + 1);
+              setTimeout(() => {
+                if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
+                  enqueueTask(request.taskId, request, task.config, 0);
+                  socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "working", message: `The source changed while the proposal was being prepared. Refreshing the review… (${refreshAttempts + 1}/${MAX_REFRESH_ATTEMPTS})` }));
+                }
+              }, 500 * (refreshAttempts + 1));
+            } else {
+              socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "error", message: "The source is still changing after multiple refresh attempts. Stop the dev-server edit or try the request again." }));
+            }
+            return;
+          }
+          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "review", message: proposal.summary, changes: proposal.changes }));
+        })
+        .catch((error: unknown) => {
+          if (socket.readyState !== socket.OPEN) return;
+          if (controller.signal.aborted) {
+            socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "stopped", message: "Agent stopped." }));
+            return;
+          }
+          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "error", message: error instanceof Error ? error.message : "The agent could not prepare a change." }));
+        })
+        .finally(() => {
+          if (taskControllers.get(request.taskId) === controller) taskControllers.delete(request.taskId);
+          runningTasks.delete(request.taskId);
+          taskPriority.delete(request.taskId);
+          processTaskQueue();
+        });
+    } else if (task.message.type === "ask") {
+      const controller = new AbortController();
+      taskControllers.set(task.taskId, controller);
+      socket.send(JSON.stringify({ type: "agent_status", taskId: task.taskId, status: "working", message: "Working…" }));
+      void answerQuestion(cwd, {
+        taskId: task.taskId,
+        question: (task.message as Extract<BridgeMessage, { type: "ask" }>).question,
+        context: (task.message as Extract<BridgeMessage, { type: "ask" }>).context,
+        element: (task.message as Extract<BridgeMessage, { type: "ask" }>).element,
+        messages: (task.message as Extract<BridgeMessage, { type: "ask" }>).messages,
+      }, task.config, controller.signal, (message, detail, level) => {
+        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({ type: "agent_status", taskId: task.taskId, status: level === "error" ? "error" : "working", message, detail }));
+        }
+      }, (prompt) => {
+        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
+          socket.send(JSON.stringify({ type: "agent_prompt", taskId: task.taskId, prompt }));
+        }
+      }).then((answer) => {
+        if (!controller.signal.aborted) socket.send(JSON.stringify({ type: "assistant_message", taskId: task.taskId, message: answer }));
+      }).catch((error: unknown) => {
+        if (!controller.signal.aborted) socket.send(JSON.stringify({ type: "agent_status", taskId: task.taskId, status: "error", message: error instanceof Error ? error.message : "The agent could not answer." }));
+      }).finally(() => {
+        if (taskControllers.get(task.taskId) === controller) taskControllers.delete(task.taskId);
+        runningTasks.delete(task.taskId);
+        taskPriority.delete(task.taskId);
+        processTaskQueue();
+      });
+    }
+  }
+
+  function enqueueTask(taskId: string, message: BridgeMessage, config: AgentConfig, priority = 0): void {
+    taskPriority.set(taskId, priority);
+    taskQueue.push({ taskId, message, config });
+    processTaskQueue();
+  }
+
   // Fetch workspace configuration from server (dashboard-configured providers)
   let workspaceConfig: WorkspaceConfig | null = null;
   if (lassoKeyConfigured) {
@@ -785,6 +905,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
   wss.on("connection", (socket) => {
     overlaySocket = socket;
+    currentSocket = socket;
     console.log(chalk.green("✓") + " Overlay connected");
     const creds = loadCredentials();
     const userInfo = creds?.userName
@@ -798,53 +919,6 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       if (socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: "git_state", git }));
     });
 
-    const runEditReview = (request: Extract<BridgeMessage, { type: "edit" }>, config: AgentConfig, statusMessage?: string) => {
-      taskControllers.get(request.taskId)?.abort();
-      const controller = new AbortController();
-      taskControllers.set(request.taskId, controller);
-      if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "working", message: statusMessage || "Working…" }));
-      }
-      void proposeChanges(cwd, request, config, controller.signal, (message, detail, level) => {
-        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
-          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: level === "error" ? "error" : "working", message, detail }));
-        }
-      }, (prompt) => {
-        if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
-          socket.send(JSON.stringify({ type: "agent_prompt", taskId: request.taskId, prompt }));
-        }
-      })
-        .then((proposal) => {
-          if (controller.signal.aborted || socket.readyState !== socket.OPEN) return;
-          if (!proposalMatchesCurrentSource(cwd, proposal.changes)) {
-            const refreshAttempts = reviewRefreshAttempts.get(request.taskId) || 0;
-            const MAX_REFRESH_ATTEMPTS = 3;
-            if (refreshAttempts < MAX_REFRESH_ATTEMPTS) {
-              reviewRefreshAttempts.set(request.taskId, refreshAttempts + 1);
-              setTimeout(() => {
-                if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
-                  runEditReview(request, config, `The source changed while the proposal was being prepared. Refreshing the review… (${refreshAttempts + 1}/${MAX_REFRESH_ATTEMPTS})`);
-                }
-              }, 500 * (refreshAttempts + 1));
-            } else {
-              socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "error", message: "The source is still changing after multiple refresh attempts. Stop the dev-server edit or try the request again." }));
-            }
-            return;
-          }
-          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "review", message: proposal.summary, changes: proposal.changes }));
-        })
-        .catch((error: unknown) => {
-          if (socket.readyState !== socket.OPEN) return;
-          if (controller.signal.aborted) {
-            socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "stopped", message: "Agent stopped." }));
-            return;
-          }
-          socket.send(JSON.stringify({ type: "agent_status", taskId: request.taskId, status: "error", message: error instanceof Error ? error.message : "The agent could not prepare a change." }));
-        })
-        .finally(() => {
-          if (taskControllers.get(request.taskId) === controller) taskControllers.delete(request.taskId);
-        });
-    };
 
     socket.on("message", async (raw) => {
       const msg: BridgeMessage = JSON.parse(raw.toString());
@@ -950,18 +1024,8 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
             serverUrl: collabConfig?.serverUrl || serverUrlFrom(fileEnv),
           };
         }
-        socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "working", message: "Working…" }));
-        void answerQuestion(cwd, { taskId: msg.taskId, question: msg.question, context: msg.context, element: msg.element, messages: msg.messages }, selectedConfig, controller.signal, (message, detail, level) => {
-          if (!controller.signal.aborted && socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: level === "error" ? "error" : "working", message, detail }));
-        }, (prompt) => {
-          if (!controller.signal.aborted && socket.readyState === socket.OPEN) socket.send(JSON.stringify({ type: "agent_prompt", taskId: msg.taskId, prompt }));
-        }).then((answer) => {
-          if (!controller.signal.aborted) socket.send(JSON.stringify({ type: "assistant_message", taskId: msg.taskId, message: answer }));
-        }).catch((error: unknown) => {
-          if (!controller.signal.aborted) socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "error", message: error instanceof Error ? error.message : "The agent could not answer." }));
-        }).finally(() => {
-          if (taskControllers.get(msg.taskId) === controller) taskControllers.delete(msg.taskId);
-        });
+        // Enqueue task for concurrent execution
+        enqueueTask(msg.taskId, msg, selectedConfig, 1); // Priority 1 for ask tasks
       } else if (msg.type === "edit") {
         const localProvider = msg.provider === "cli";
         const cliProvider = msg.model?.startsWith("claude-code:") ? "claude-code" : msg.model?.startsWith("opencode:") ? "opencode" : msg.model?.startsWith("cursor:") ? "cursor" : "codex";
@@ -998,12 +1062,24 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         editRequests.set(msg.taskId, msg);
         editConfigs.set(msg.taskId, selectedConfig);
         reviewRefreshAttempts.set(msg.taskId, 0);
-        runEditReview(msg, selectedConfig);
+        // Enqueue task for concurrent execution with higher priority (0)
+        enqueueTask(msg.taskId, msg, selectedConfig, 0);
       } else if (msg.type === "agent_prompt_response") {
         respondToAgentPrompt(msg.taskId, msg.response);
       } else if (msg.type === "stop") {
-        if (msg.taskId) taskControllers.get(msg.taskId)?.abort();
-        else for (const controller of taskControllers.values()) controller.abort();
+        if (msg.taskId) {
+          taskControllers.get(msg.taskId)?.abort();
+          // Remove from queue and running tasks
+          const queueIndex = taskQueue.findIndex(t => t.taskId === msg.taskId);
+          if (queueIndex !== -1) taskQueue.splice(queueIndex, 1);
+          runningTasks.delete(msg.taskId);
+          taskPriority.delete(msg.taskId);
+        } else {
+          for (const controller of taskControllers.values()) controller.abort();
+          taskQueue.length = 0;
+          runningTasks.clear();
+          taskPriority.clear();
+        }
         socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "stopped", message: "Agent stopped." }));
       } else if (msg.type === "runtime_error") {
         socket.send(JSON.stringify({ type: "agent_status", status: "error", message: `Runtime error detected${msg.selectionId ? ` for selection ${msg.selectionId}` : ""}: ${msg.details}` }));
@@ -1193,8 +1269,39 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         });
       } else if (msg.type === "apply") {
         try {
+          // Create snapshot before applying changes
+          const filePaths = [...new Set(msg.changes.map(c => c.filePath))];
+          const parentSnapshot = getSnapshotByTaskId(cwd, msg.taskId);
+
+          // Create pre-apply snapshot
+          const preSnapshot = createSnapshot(
+            cwd,
+            msg.taskId,
+            `Pre-apply: ${msg.changes.length} file${msg.changes.length === 1 ? "" : "s"}`,
+            filePaths,
+            parentSnapshot?.id
+          );
+
           const snapshots: Array<{ filePath: string; content: string | null }> = [];
           const planned = new Map<string, { filePath: string; content: string; exists: boolean; start: number; end: number; oldString: string; newString: string }[]>();
+
+          // Check for conflicts before applying
+          const expectedFiles = msg.changes.map(change => ({
+            filePath: change.filePath,
+            content: change.oldString || null,
+          }));
+          const conflicts = detectConflicts(cwd, expectedFiles);
+
+          if (conflicts.length > 0) {
+            socket.send(JSON.stringify({
+              type: "conflict_detected",
+              taskId: msg.taskId,
+              conflicts,
+              message: `Conflict detected in ${conflicts.length} file${conflicts.length === 1 ? "" : "s"}. The source has changed since the suggestion was generated.`
+            }));
+            return;
+          }
+
           for (const change of msg.changes) {
             const isNew = !change.oldString;
             const filePath = resolveProposedFile(cwd, change.filePath, true);
@@ -1227,9 +1334,18 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
             fs.writeFileSync(filePath, nextContent);
           }
 
+          // Create post-apply snapshot
+          createSnapshot(
+            cwd,
+            msg.taskId,
+            `Applied: ${msg.changes.length} file${msg.changes.length === 1 ? "" : "s"}`,
+            filePaths,
+            preSnapshot.id
+          );
+
           // Run build validation after applying changes
           const validation = await validateBuild(cwd);
-          
+
           if (!validation.passed) {
             // Build failed - automatically trigger retry with build error context
             const errorContext = validation.errors.slice(0, 10).join("\n");
@@ -1240,7 +1356,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
               message: `⚠️ Build validation failed. Attempting to fix build errors automatically...`,
               detail: `Build command: ${validation.command}\nErrors:\n${errorContext}${validation.errors.length > 10 ? `\n... and ${validation.errors.length - 10} more errors` : ""}`
             }));
-            
+
             // Store context for retry
             buildErrorContext.set(msg.taskId, {
               errors: validation.errors,
@@ -1248,12 +1364,12 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
               originalChanges: msg.changes,
               retryCount: 0
             });
-            
+
             // Trigger automatic build fix
             await triggerBuildFix(cwd, msg.taskId, validation.errors, validation.command, msg.changes, resolvedLassoKey, agentConfig, collabConfig, socket, taskControllers, taskSnapshots, buildErrorContext);
             return;
           }
-          
+
           socket.send(JSON.stringify({
             type: "applied",
             taskId: msg.taskId,
@@ -1278,7 +1394,8 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
           const refreshAttempts = reviewRefreshAttempts.get(msg.taskId) || 0;
           if (sourceChanged && editRequest && editConfig && refreshAttempts < 1) {
             reviewRefreshAttempts.set(msg.taskId, refreshAttempts + 1);
-            runEditReview(editRequest, editConfig, "The source changed. Refreshing the review against the current file…");
+            enqueueTask(msg.taskId, editRequest, editConfig, 0);
+            socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "working", message: "The source changed. Refreshing the review against the current file…" }));
           } else {
             socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "error", message }));
           }
@@ -1294,11 +1411,113 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         }
         taskSnapshots.delete(msg.taskId || "");
         socket.send(JSON.stringify({ type: "undone", taskId: msg.taskId, message: snapshots.length ? "The accepted change was reverted." : "There is no accepted change to undo." }));
+      } else if (msg.type === "resolve_conflict") {
+        const { taskId, action, conflicts } = msg;
+
+        if (action === "retry") {
+          // Re-run the edit request with current file content
+          const editRequest = editRequests.get(taskId);
+          const editConfig = editConfigs.get(taskId);
+          if (editRequest && editConfig) {
+            reviewRefreshAttempts.set(taskId, 0);
+            enqueueTask(taskId, editRequest, editConfig, 0);
+            socket.send(JSON.stringify({ type: "agent_status", taskId, status: "working", message: "Retrying with current file content..." }));
+          } else {
+            socket.send(JSON.stringify({ type: "agent_status", taskId, status: "error", message: "Could not retry: original request not found." }));
+          }
+        } else if (action === "force") {
+          // Force apply despite conflicts (user's choice)
+          try {
+            const snapshots: Array<{ filePath: string; content: string | null }> = [];
+            const planned = new Map<string, { filePath: string; content: string; exists: boolean; start: number; end: number; oldString: string; newString: string }[]>();
+
+            // Get the original changes from the edit request
+            const editRequest = editRequests.get(taskId);
+            if (!editRequest) {
+              socket.send(JSON.stringify({ type: "agent_status", taskId, status: "error", message: "Could not force apply: original request not found." }));
+              return;
+            }
+
+            // Re-prepare changes with current content (may fail, but that's expected)
+            for (const change of editRequest.changesHistory?.[editRequest.changesHistory.length - 1]?.changes || []) {
+              const isNew = !change.oldString;
+              const filePath = resolveProposedFile(cwd, change.filePath, true);
+              const exists = fs.existsSync(filePath);
+              const content = exists ? fs.readFileSync(filePath, "utf8") : "";
+              const prepared = (!exists || isNew)
+                ? { start: 0, end: content.length, oldString: content, newString: change.newString }
+                : prepareChange(content, change);
+              const fileChanges = planned.get(filePath) || [];
+              if (fileChanges.some((item) => prepared.start < item.end && item.start < prepared.end)) {
+                throw new Error(`Could not safely apply ${change.filePath}. Proposed changes overlap.`);
+              }
+              fileChanges.push({ filePath, content, exists, ...prepared });
+              planned.set(filePath, fileChanges);
+            }
+
+            taskSnapshots.set(taskId, snapshots);
+            for (const [filePath, changes] of planned) {
+              const exists = changes[0]!.exists;
+              const content = changes[0]!.content;
+              snapshots.push({ filePath, content: exists ? content : null });
+              const nextContent = exists
+                ? [...changes]
+                    .sort((a, b) => b.start - a.start)
+                    .reduce((value, change) => value.slice(0, change.start) + change.newString + value.slice(change.end), content)
+                : changes[0]!.newString;
+              fs.mkdirSync(path.dirname(filePath), { recursive: true });
+              fs.writeFileSync(filePath, nextContent);
+            }
+
+            socket.send(JSON.stringify({
+              type: "applied",
+              taskId,
+              message: "Changes force-applied despite conflicts."
+            }));
+          } catch (error) {
+            for (const snapshot of taskSnapshots.get(taskId) || []) {
+              if (snapshot.content === null) {
+                if (fs.existsSync(snapshot.filePath)) fs.unlinkSync(snapshot.filePath);
+              } else {
+                fs.writeFileSync(snapshot.filePath, snapshot.content);
+              }
+            }
+            taskSnapshots.delete(taskId);
+            socket.send(JSON.stringify({ type: "agent_status", taskId, status: "error", message: error instanceof Error ? error.message : "Force apply failed." }));
+          }
+        } else if (action === "rebase") {
+          // User wants to rebase - re-run the edit with updated context
+          const editRequest = editRequests.get(taskId);
+          const editConfig = editConfigs.get(taskId);
+          if (editRequest && editConfig) {
+            reviewRefreshAttempts.set(taskId, 0);
+            enqueueTask(taskId, editRequest, editConfig, 0);
+            socket.send(JSON.stringify({ type: "agent_status", taskId, status: "working", message: "Rebasing changes against current file content..." }));
+          } else {
+            socket.send(JSON.stringify({ type: "agent_status", taskId, status: "error", message: "Could not rebase: original request not found." }));
+          }
+        }
+      } else if (msg.type === "restore_snapshot") {
+        const success = restoreSnapshot(cwd, msg.snapshotId);
+        socket.send(JSON.stringify({
+          type: "agent_status",
+          message: success ? "Snapshot restored successfully." : "Failed to restore snapshot."
+        }));
+      } else if (msg.type === "get_timeline") {
+        const timeline = getTimeline(cwd);
+        socket.send(JSON.stringify({ type: "timeline", snapshots: timeline }));
+      } else if (msg.type === "delete_snapshot") {
+        const success = deleteSnapshot(cwd, msg.snapshotId);
+        socket.send(JSON.stringify({
+          type: "agent_status",
+          message: success ? "Snapshot deleted." : "Failed to delete snapshot."
+        }));
       }
     });
 
     socket.on("close", () => {
       overlaySocket = null;
+      currentSocket = null;
       console.log(chalk.yellow("!") + " Overlay disconnected");
     });
   });
@@ -1317,8 +1536,9 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
   bridgeServer.listen(bridgePort, "127.0.0.1");
 
   function send(msg: ServerBridgeMessage) {
-    if (overlaySocket?.readyState === overlaySocket?.OPEN) {
-      overlaySocket!.send(JSON.stringify(msg));
+    const socket = currentSocket;
+    if (socket && socket.readyState === socket.OPEN) {
+      socket.send(JSON.stringify(msg));
     }
   }
 

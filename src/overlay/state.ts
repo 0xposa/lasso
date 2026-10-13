@@ -11,6 +11,7 @@ import type {
   PendingChange,
   AgentTask,
   ScreenshotContext,
+  TimelineSnapshot,
 } from "./types";
 
 export const COLLAB_COLORS = [
@@ -180,6 +181,9 @@ export class OverlayState {
   collabHeartbeat: number | null = null;
   activityTimer: number | null = null;
   spotlightTimer: number | null = null;
+
+  // Timeline/Snapshot History
+  timelineSnapshots: TimelineSnapshot[] = [];
 
   constructor() {
     const saved = storedModelId();

@@ -274,27 +274,20 @@ export async function runOneShotAgent(
     console.log('[Lasso] Is conversational:', isConversational);
 
     // Browser inspection & snapshot steps - skip for simple conversational queries
+    // FAST CONTEXT: Skip detailed DOM analysis if pageContext is already provided
     if (pageContext && !isConversational) {
       onProgress(
         "thinking",
-        "Inspecting browser page...",
+        "Analyzing page context...",
         `Page: "${pageContext.title || "Landing page"}" (${pageContext.route || "/"})`
       );
+      // Skip the slow "Scrolling & analyzing" steps - the pageContext already has the data
+      // Only show viewport info if available
       if (pageContext.viewport) {
         onProgress(
           "thinking",
-          "Capturing visual snapshot...",
-          `Viewport: ${pageContext.viewport.width}x${pageContext.viewport.height} (Document height: ${pageContext.viewport.scrollHeight}px)`
-        );
-      }
-      if (pageContext.domSummary) {
-        const sectionsCount = pageContext.domSummary.sections?.length || 0;
-        const headingsCount = pageContext.domSummary.headings?.length || 0;
-        const buttonsCount = pageContext.domSummary.buttons?.length || 0;
-        onProgress(
-          "thinking",
-          "Scrolling & analyzing page sections...",
-          `${sectionsCount} sections, ${headingsCount} headings, ${buttonsCount} CTAs detected`
+          "Ready to proceed...",
+          `Viewport: ${pageContext.viewport.width}x${pageContext.viewport.height}`
         );
       }
     } else {
@@ -768,41 +761,64 @@ async function analyzeProject(cwd: string): Promise<ProjectStructure> {
   const hasNext = dependencies.includes("next") || devDependencies.includes("next");
   const hasVite = dependencies.includes("vite") || devDependencies.includes("vite");
 
-  // Scan directory structure
+  // FAST CONTEXT: Only scan top-level directories, not full recursive scan
+  // This is the key optimization - let the server-side agent handle file discovery
   const files: string[] = [];
   const directories: string[] = [];
   const appDirs: string[] = [];
   const pagesDirs: string[] = [];
 
-  const roots = ["src", "app", "pages", ".", "web", "lib", "components"];
+  const roots = ["src", "app", "pages", "components", "lib"];
   for (const root of roots) {
     const rootPath = path.join(cwd, root);
     if (!fs.existsSync(rootPath)) continue;
-    const scanDir = (dir: string, base: string = "", depth = 0) => {
-      if (depth > 5) return;
-      try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === "build" || entry.name === ".next") {
-            continue;
-          }
-          const rel = base ? path.join(base, entry.name) : entry.name;
-          if (entry.isDirectory()) {
-            directories.push(rel);
-            // Track app and pages directories
-            if (entry.name === "app") appDirs.push(rel);
-            if (entry.name === "pages") pagesDirs.push(rel);
-            scanDir(path.join(dir, entry.name), rel, depth + 1);
-          } else if (/\.(tsx?|jsx?|vue|svelte|css|html|json)$/i.test(entry.name)) {
-            files.push(rel);
-          }
+
+    // Only scan top-level (depth 0-1), not recursive
+    try {
+      const entries = fs.readdirSync(rootPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") {
+          continue;
         }
-      } catch {
-        // ignore scan errors
+        const rel = entry.name;
+        if (entry.isDirectory()) {
+          directories.push(rel);
+          // Track app and pages directories at top level
+          if (entry.name === "app") appDirs.push(rel);
+          if (entry.name === "pages") pagesDirs.push(rel);
+          // Only scan one level deep for key directories
+          if (["components", "lib", "hooks", "utils", "styles"].includes(entry.name)) {
+            try {
+              const subEntries = fs.readdirSync(path.join(rootPath, entry.name), { withFileTypes: true });
+              for (const subEntry of subEntries) {
+                if (!subEntry.name.startsWith(".") && !subEntry.isDirectory() && /\.(tsx?|jsx?|vue|svelte|css)$/i.test(subEntry.name)) {
+                  files.push(path.join(rel, subEntry.name));
+                }
+              }
+            } catch {
+              // ignore scan errors
+            }
+          }
+        } else if (/\.(tsx?|jsx?|vue|svelte|css|html|json)$/i.test(entry.name)) {
+          files.push(rel);
+        }
       }
-    };
-    scanDir(rootPath);
-    if (files.length > 100) break;
+    } catch {
+      // ignore scan errors
+    }
+    if (files.length > 20) break; // Limit to 20 files for fast context
+  }
+
+  // Also check root directory for key files
+  try {
+    const rootEntries = fs.readdirSync(cwd, { withFileTypes: true });
+    for (const entry of rootEntries) {
+      if (!entry.isDirectory() && /\.(tsx?|jsx?|vue|svelte|css|html|json)$/i.test(entry.name)) {
+        files.push(entry.name);
+      }
+    }
+  } catch {
+    // ignore scan errors
   }
 
   // Determine source root
@@ -811,12 +827,9 @@ async function analyzeProject(cwd: string): Promise<ProjectStructure> {
   else if (directories.includes("app")) sourceRoot = ".";
   else if (directories.includes("src")) sourceRoot = "src";
 
-  // Detect App Router vs Pages Router
-  const appRouter = appDirs.length > 0 && appDirs.some(dir => {
-    const appPath = path.join(cwd, dir);
-    return fs.existsSync(path.join(appPath, "layout.tsx")) || fs.existsSync(path.join(appPath, "page.tsx"));
-  });
-  const pagesRouter = pagesDirs.length > 0 && fs.existsSync(path.join(cwd, "pages", "_app.tsx")) || fs.existsSync(path.join(cwd, "pages", "_document.tsx"));
+  // Detect App Router vs Pages Router (lightweight check)
+  const appRouter = appDirs.length > 0 && fs.existsSync(path.join(cwd, "app", "layout.tsx")) || fs.existsSync(path.join(cwd, "app", "page.tsx"));
+  const pagesRouter = pagesDirs.length > 0 && (fs.existsSync(path.join(cwd, "pages", "_app.tsx")) || fs.existsSync(path.join(cwd, "pages", "_document.tsx")));
 
   return {
     framework: detectFramework(cwd),
