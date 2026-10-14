@@ -8,6 +8,9 @@ import { startProjectRuntime, type ProjectRuntime } from "./runtime";
 import { startDnsServer, createDomainResolver, syncResolverAfterRegister, type DomainResolver, type DnsServerHandle } from "./dns";
 import { PID_FILE, LOG_FILE, domainOf, isLassoDomain } from "./paths";
 import { ensureHostCertificate, hostCertificateStatus, TLS_CERT_FILE, TLS_KEY_FILE } from "./certificates";
+import packageJson from "../../../package.json";
+
+const CURRENT_VERSION = packageJson.version;
 
 export const SERVICE_NAME = "lasso-host";
 
@@ -257,7 +260,9 @@ export class LassoHost {
     writeJson(res, 200, {
       ok: true,
       service: SERVICE_NAME,
-      version: this.opts.version || "unknown",
+      version: this.opts.version || CURRENT_VERSION,
+      installedVersion: CURRENT_VERSION,
+      versionMismatch: (this.opts.version || CURRENT_VERSION) !== CURRENT_VERSION,
       pid: process.pid,
       dnsPort: this.dnsHandle?.port ?? null,
       proxyPort: this.opts.proxyPort,

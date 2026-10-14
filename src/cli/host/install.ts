@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
+import chalk from "chalk";
 import { hostAlive, readDaemonPid, isProcessAlive } from "./client";
 import { createDomainResolver, type DomainResolver } from "./dns";
 import { LOG_FILE, hostProxyPort, hostHttpsPort, hostDnsPort } from "./paths";
+import packageJson from "../../../package.json";
+
+const CURRENT_VERSION = packageJson.version;
 
 const AGENT_LABEL = "com.lasso.host";
 const LAUNCH_AGENT_FILE = path.join(os.homedir(), "Library", "LaunchAgents", `${AGENT_LABEL}.plist`);
@@ -15,12 +19,22 @@ function cliEntry(): string | null {
   return entry && entry.endsWith(".js") ? entry : null;
 }
 
-export function spawnDaemon(env: Record<string, string>): Promise<{ ok: boolean; alreadyRunning?: boolean; pid?: number; error?: string }> {
+export function spawnDaemon(env: Record<string, string>): Promise<{ ok: boolean; alreadyRunning?: boolean; pid?: number; error?: string; restarted?: boolean }> {
   const port = hostProxyPort(env);
   const dnsPort = hostDnsPort(env);
   const httpsPort = hostHttpsPort(env);
   return hostAlive(port).then(async (health) => {
-    if (health) return { ok: true, alreadyRunning: true };
+    if (health) {
+      // Check if the running daemon has a different version
+      if (health.version && health.version !== CURRENT_VERSION) {
+        console.log(chalk.yellow(`!`) + ` Lasso Host is running version ${health.version} but installed version is ${CURRENT_VERSION}. Restarting...`);
+        await stopDaemon(env);
+        // Wait a moment for the daemon to stop
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } else {
+        return { ok: true, alreadyRunning: true };
+      }
+    }
     const entry = cliEntry();
     if (!entry) return { ok: false, error: "Could not resolve the Lasso CLI entry point. Run this from the installed CLI." };
     const child = spawn(process.execPath, [entry, "_host"], {
@@ -32,7 +46,7 @@ export function spawnDaemon(env: Record<string, string>): Promise<{ ok: boolean;
     const pid = child.pid;
     child.unref();
     await new Promise((resolve) => setTimeout(resolve, 1800));
-    if (await hostAlive(port)) return { ok: true, pid };
+    if (await hostAlive(port)) return { ok: true, pid, restarted: Boolean(health && health.version !== CURRENT_VERSION) };
     return { ok: false, error: `Lasso Host did not come up on port ${port}. Check ${LOG_FILE}.` };
   });
 }
