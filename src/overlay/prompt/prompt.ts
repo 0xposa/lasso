@@ -59,6 +59,10 @@ const providerLabels: Record<ModelOption["provider"], string> = {
   nvidia: "NVIDIA",
   ollama: "Local",
   cli: "CLI",
+  claude_code: "Claude Code",
+  opencode: "OpenCode",
+  codex_cli: "Codex CLI",
+  cursor: "Cursor",
 };
 
 const providerIcons = {
@@ -68,13 +72,20 @@ const providerIcons = {
   nvidia: nvidiaIcon,
   ollama: terminalIcon,
   cli: terminalIcon,
+  claude_code: terminalIcon,
+  opencode: terminalIcon,
+  codex_cli: terminalIcon,
+  cursor: terminalIcon,
 };
 
 export function providerIcon(provider: ModelOption["provider"], active = false): string {
-  if (provider === "cli") {
-    return `<span class="${active ? "lasso-model-active-icon" : "lasso-model-item-icon"} provider-cli" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" focusable="false"><circle cx="12" cy="12" r="9" fill="currentColor" opacity=".16"/><circle cx="12" cy="9" r="3" fill="currentColor"/><path d="M6.5 18c.9-2.4 2.7-3.6 5.5-3.6s4.6 1.2 5.5 3.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>`;
+  if (provider === "cli" || provider === "claude_code" || provider === "opencode" || provider === "codex_cli" || provider === "cursor") {
+    return `<span class="${active ? "lasso-model-active-icon" : "lasso-model-item-icon"} provider-${provider}" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" focusable="false"><circle cx="12" cy="12" r="9" fill="currentColor" opacity=".16"/><circle cx="12" cy="9" r="3" fill="currentColor"/><path d="M6.5 18c.9-2.4 2.7-3.6 5.5-3.6s4.6 1.2 5.5 3.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>`;
   }
   const icon = providerIcons[provider];
+  if (!icon) {
+    return `<span class="${active ? "lasso-model-active-icon" : "lasso-model-item-icon"} provider-${provider}" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" focusable="false"><circle cx="12" cy="12" r="9" fill="currentColor" opacity=".16"/><circle cx="12" cy="9" r="3" fill="currentColor"/><path d="M6.5 18c.9-2.4 2.7-3.6 5.5-3.6s4.6 1.2 5.5 3.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span>`;
+  }
   return `<span class="${active ? "lasso-model-active-icon" : "lasso-model-item-icon"} provider-${provider}" aria-hidden="true"><svg viewBox="0 0 ${icon.width} ${icon.height}" xmlns="http://www.w3.org/2000/svg" focusable="false">${icon.body}</svg></span>`;
 }
 
@@ -648,41 +659,56 @@ function respondToAgentPrompt(response: string): void {
   appendChat("assistant", `Responded to the agent: ${response}`, taskId);
 }
 
+const LOCAL_AGENT_PROVIDERS = new Set(["cli", "claude_code", "opencode", "codex_cli", "cursor"]);
+
 export function buildModelMenuContent(menuEl: HTMLElement, onRefresh: () => void): void {
   const filters = document.createElement("div");
   filters.className = "lasso-model-filters";
-  const providers = ["all", ...Array.from(new Set(state.MODELS.map((m) => m.provider)))];
+  const allProviders = Array.from(new Set(state.MODELS.map((m) => m.provider)));
+  // Collapse local-agent providers into a single "CLI" filter chip.
+  const hasLocal = allProviders.some((p) => LOCAL_AGENT_PROVIDERS.has(p));
+  const hostedProviders = allProviders.filter((p) => !LOCAL_AGENT_PROVIDERS.has(p));
+  const providers = ["all", ...hostedProviders, ...(hasLocal ? ["cli"] : [])];
 
   for (const provider of providers) {
     const filter = document.createElement("button");
     filter.type = "button";
     filter.className = `lasso-model-filter${state.modelFilter === provider ? " active" : ""}`;
     filter.dataset.providerFilter = provider;
-    filter.textContent = provider === "all" ? "All" : providerLabels[provider as ModelOption["provider"]];
+    filter.textContent = provider === "all" ? "All" : providerLabels[provider as ModelOption["provider"]] || provider;
     filters.appendChild(filter);
   }
 
   const children: Node[] = [filters];
-  const visibleProviders = state.modelFilter === "all" ? providers.slice(1) : [state.modelFilter];
+  // Map the "cli" filter chip back to all local-agent providers.
+  const visibleProviders = state.modelFilter === "all"
+    ? providers.slice(1)
+    : state.modelFilter === "cli"
+      ? ["cli"]
+      : [state.modelFilter];
 
   for (const provider of visibleProviders) {
-    const models = state.MODELS.filter((m) => m.provider === provider);
+    const isCliGroup = provider === "cli";
+    const models = isCliGroup
+      ? state.MODELS.filter((m) => LOCAL_AGENT_PROVIDERS.has(m.provider))
+      : state.MODELS.filter((m) => m.provider === provider);
     if (!models.length) continue;
     const group = document.createElement("div");
     group.className = "lasso-model-group";
-    group.textContent = providerLabels[provider as ModelOption["provider"]];
+    group.textContent = isCliGroup ? "CLI" : providerLabels[provider as ModelOption["provider"]] || provider;
     children.push(group);
 
-    if (provider === "cli") {
+    if (isCliGroup) {
+      // Subgroup by agent provider (claude_code, opencode, codex_cli, cursor).
       const cliGroups = new Map<string, ModelOption[]>();
       for (const model of models) {
-        const key = model.id.split(":", 1)[0] || "cli";
+        const key = model.provider;
         const groupModels = cliGroups.get(key) || [];
         groupModels.push(model);
         cliGroups.set(key, groupModels);
       }
-      const selectedCliGroup = state.selectedModel.id.split(":", 1)[0];
-      if (selectedCliGroup && !openCliGroups.size) openCliGroups.add(selectedCliGroup);
+      const selectedCliGroup = state.selectedModel.provider;
+      if (selectedCliGroup && LOCAL_AGENT_PROVIDERS.has(selectedCliGroup) && !openCliGroups.size) openCliGroups.add(selectedCliGroup);
       for (const [cliKey, cliModels] of cliGroups) {
         const subGroup = document.createElement("div");
         subGroup.className = "lasso-cli-subgroup";
@@ -690,7 +716,7 @@ export function buildModelMenuContent(menuEl: HTMLElement, onRefresh: () => void
         subHeader.type = "button";
         subHeader.className = "lasso-cli-subgroup-header";
         subHeader.setAttribute("aria-expanded", String(openCliGroups.has(cliKey)));
-        subHeader.innerHTML = `<span>${cliLabel(cliKey)}</span><span class="lasso-cli-subgroup-chevron">${openCliGroups.has(cliKey) ? "⌃" : "⌄"}</span>`;
+        subHeader.innerHTML = `<span>${providerLabels[cliKey as ModelOption["provider"]] || cliKey}</span><span class="lasso-cli-subgroup-chevron">${openCliGroups.has(cliKey) ? "⌃" : "⌄"}</span>`;
         const subItems = document.createElement("div");
         subItems.className = "lasso-cli-subgroup-items";
         subItems.hidden = !openCliGroups.has(cliKey);
