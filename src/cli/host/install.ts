@@ -16,7 +16,16 @@ const LAUNCH_AGENT_FILE = path.join(os.homedir(), "Library", "LaunchAgents", `${
 
 function cliEntry(): string | null {
   const entry = process.argv[1];
-  return entry && entry.endsWith(".js") ? entry : null;
+  if (!entry) return null;
+  // Resolve symlinks (e.g. pnpm's global bin is extensionless) so the
+  // spawned child gets a real .js path.
+  let resolved = entry;
+  try {
+    resolved = fs.realpathSync(entry);
+  } catch {
+    // keep the original if realpath fails
+  }
+  return resolved.endsWith(".js") ? resolved : null;
 }
 
 export function spawnDaemon(env: Record<string, string>): Promise<{ ok: boolean; alreadyRunning?: boolean; pid?: number; error?: string; restarted?: boolean }> {
