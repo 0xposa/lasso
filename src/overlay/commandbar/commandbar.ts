@@ -13,6 +13,7 @@ export interface SourceChange {
   filePath: string;
   oldString: string;
   newString: string;
+  operation?: "created" | "modified" | "deleted";
 }
 
 export interface CommandThinkingStep {
@@ -1465,7 +1466,13 @@ function renderDiffPreview(changes: SourceChange[]): string {
           (c) => `
         <div class="lasso-command-diff-file">
           <div class="lasso-command-diff-file-header">${escapeHtml(c.filePath)}</div>
-          <pre class="lasso-command-diff-content">${c.oldString ? `<span class="lasso-diff-del">- ${escapeHtml(c.oldString.slice(0, 300))}</span>\n` : ""}<span class="lasso-diff-add">+ ${escapeHtml(c.newString.slice(0, 300))}</span></pre>
+          <pre class="lasso-command-diff-content">${
+            c.operation === "deleted" || (c.newString === "" && c.oldString !== "")
+              ? `<span class="lasso-diff-del">- ${escapeHtml(c.oldString.slice(0, 300))}</span>\n<span class="lasso-diff-del">(file deleted)</span>`
+              : `${c.oldString ? `<span class="lasso-diff-del">- ${escapeHtml(c.oldString.slice(0, 300))}</span>\n` : ""}${
+                  c.newString ? `<span class="lasso-diff-add">+ ${escapeHtml(c.newString.slice(0, 300))}</span>` : ""
+                }`
+          }</pre>
         </div>
       `
         )

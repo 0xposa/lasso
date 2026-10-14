@@ -1,9 +1,24 @@
 {
   "name": "@lasso-ai/cli",
-  "version": "1.4.5",
+  "version": "1.5.0",
   "description": "Select any part of your running app, describe a change, and let AI edit the real source code.",
   "type": "commonjs",
   "main": "dist/cli/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/cli/index.d.ts",
+      "default": "./dist/cli/index.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime/index.d.ts",
+      "default": "./dist/runtime/index.js"
+    },
+    "./local-runtime": {
+      "types": "./dist/cli/local-runtime.d.ts",
+      "default": "./dist/cli/local-runtime.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "lasso": "dist/cli/index.js"
   },
@@ -15,7 +30,8 @@
     "CONTRIBUTING.md",
     "SECURITY.md",
     "SUPPORT.md",
-    "docs/PUBLISHING.md"
+    "docs/PUBLISHING.md",
+    "docs/local-coding-agents.md"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -33,7 +49,7 @@
     "format": "prettier --write .",
     "deploy": "pnpm build && npm publish --access public",
     "format:check": "prettier --check .",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --import tsx --test src/runtime/__tests__/*.test.ts"
   },
   "keywords": [
     "ai",

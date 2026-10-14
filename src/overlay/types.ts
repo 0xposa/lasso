@@ -2,6 +2,7 @@ export type PendingChange = {
   filePath: string;
   oldString: string;
   newString: string;
+  operation?: "created" | "modified" | "deleted";
 };
 
 export type TimelineSnapshot = {

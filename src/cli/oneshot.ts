@@ -1,44 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
-import type { AgentConfig, AgentInput, AgentProgress, AgentPrompt, SourceChange } from "./agent";
-import { proposeChanges, runLocalAgentPrompt } from "./agent";
-import { loadCredentials } from "./auth";
+import type { AgentConfig, SourceChange } from "./agent";
+import { RuntimeClient, type RuntimeSessionInput, type RuntimeEvent } from "./runtime-client";
 import { detectFramework } from "./utils/framework";
-
-const execAsync = promisify(exec);
-
-const CLI_PROVIDERS = new Set(["claude-code", "codex", "opencode", "cursor"]);
-
-function isCliProvider(provider?: string): boolean {
-  return Boolean(provider && CLI_PROVIDERS.has(provider));
-}
-
-function cliLabel(provider?: string): string {
-  return provider === "claude-code" ? "Claude Code" : provider === "opencode" ? "OpenCode" : provider === "cursor" ? "Cursor" : provider === "codex" ? "Codex" : "CLI agent";
-}
-
-function cliCommand(provider?: string): string {
-  return provider === "claude-code" ? "claude" : provider || "the agent CLI";
-}
-
-// The Lasso Agent Gateway only understands hosted providers, so a CLI selection is
-// normalized to the closest hosted provider/model when we have to fall back to it.
-const GATEWAY_MODELS = {
-  anthropic: "claude-sonnet-4-5-20250929",
-  openai: "gpt-4.1",
-  google: "gemini-2.5-flash",
-};
-
-function gatewayTargetForCli(provider?: string, model?: string): { provider: keyof typeof GATEWAY_MODELS; model: string } {
-  const bare = model && model.includes(":") ? model.slice(model.indexOf(":") + 1) : model || "";
-  if (provider === "codex") return { provider: "openai", model: GATEWAY_MODELS.openai };
-  if (provider === "cursor") return bare.includes("gpt") ? { provider: "openai", model: GATEWAY_MODELS.openai } : { provider: "anthropic", model: GATEWAY_MODELS.anthropic };
-  if (bare.startsWith("openai/") || /^gpt/i.test(bare)) return { provider: "openai", model: GATEWAY_MODELS.openai };
-  if (bare.startsWith("google/") || /^gemini/i.test(bare)) return { provider: "google", model: GATEWAY_MODELS.google };
-  return { provider: "anthropic", model: GATEWAY_MODELS.anthropic };
-}
+import { waitForAgentPrompt } from "./agent";
 
 export interface OneShotThinkingStep {
   title: string;
@@ -75,179 +40,65 @@ export interface ConversationMessage {
   content: string;
 }
 
-async function isConversationalPrompt(prompt: string, config: AgentConfig, apiKey?: string): Promise<boolean> {
-  // Use the user's selected model to intelligently detect if prompt is conversational vs. action-oriented
-  try {
-    // Use the gateway to classify - this respects the user's selected model
-    const response = await fetch(`${config.serverUrl || "https://api.lasso.byorello.space"}/api/v1/agent/generate`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey || ""}`,
-      },
-      body: JSON.stringify({
-        model: {
-          id: config.model,
-          provider: config.provider,
-        },
-        prompt: `Classify this user prompt as either "conversational" or "action". Return ONLY the word "conversational" or "action" - nothing else.
+function detectProjectStructure(cwd: string): any {
+  const pkgPath = path.join(cwd, "package.json");
+  let hasTypeScript = false;
+  let hasReact = false;
+  let hasNext = false;
+  let hasVite = false;
+  let hasTailwind = false;
+  const files: string[] = [];
+  const directories: string[] = [];
+  const dependencies: string[] = [];
+  const devDependencies: string[] = [];
 
-Prompt: "${prompt}"`,
-        maxTokens: 10,
-      }),
-    });
-
-    if (response.ok) {
-      const data = await response.json() as { reply?: string };
-      const classification = data.reply?.toLowerCase().trim();
-      console.log('[Lasso] Classification result:', classification);
-      return classification === "conversational";
-    } else {
-      console.log('[Lasso] Classification failed:', response.status);
-    }
-  } catch (err) {
-    console.log('[Lasso] Classification error:', err);
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+      const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+      hasTypeScript = Boolean(deps.typescript);
+      hasReact = Boolean(deps.react);
+      hasNext = Boolean(deps.next);
+      hasVite = Boolean(deps.vite);
+      hasTailwind = Boolean(deps.tailwindcss);
+      dependencies.push(...Object.keys(pkg.dependencies || {}));
+      devDependencies.push(...Object.keys(pkg.devDependencies || {}));
+    } catch {}
   }
 
-  // Fallback: smarter heuristic
-  const p = prompt.trim().toLowerCase();
-  const actionKeywords = /(add|create|build|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code|replace|insert|append|generate)/i;
-  const isAction = actionKeywords.test(p);
-  console.log('[Lasso] Fallback classification:', isAction ? 'action' : 'conversational');
-  return !isAction;
-}
-
-function runtimeErrorObservation(pageContext?: any): string {
-  const errors: string[] = Array.isArray(pageContext?.runtimeErrors) ? pageContext.runtimeErrors : [];
-  if (!errors.length) return "- Console/Runtime Errors: None";
-  return `- Console/Runtime Errors (the page is currently throwing these):\n${errors.map((e) => `  ! ${e}`).join("\n")}`;
-}
-
-async function generateConversationalReply(
-  cwd: string,
-  prompt: string,
-  framework: string,
-  config: AgentConfig,
-  signal: AbortSignal,
-  messages?: ConversationMessage[],
-  pageContext?: any,
-  onProgress?: AgentProgress,
-  taskId?: string,
-  onPrompt?: (prompt: AgentPrompt) => void
-): Promise<string> {
-  const history = messages?.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`).join("\n\n") || "";
-
-  let pageObservation = "";
-  if (pageContext) {
-    const headings = (pageContext.domSummary?.headings || []).map((h: any) => `H${h.level}: "${h.text}"`).join("\n  ");
-    const sections = (pageContext.domSummary?.sections || []).map((s: any) => `- [${s.name}]: ${s.textPreview}`).join("\n  ");
-    const buttons = (pageContext.domSummary?.buttons || []).join(", ");
-    const links = (pageContext.domSummary?.links || []).join(", ");
-
-    pageObservation = `
-Live Browser Page Context (what the user is currently viewing in their live app):
-- Route: ${pageContext.route || "/"}
-- Page Title: "${pageContext.title || "Untitled"}"
-- Viewport: ${pageContext.viewport?.width}x${pageContext.viewport?.height} (Document height: ${pageContext.viewport?.scrollHeight}px, scrolled: ${pageContext.viewport?.scrollY}px)
-- Rendered Headings:
-  ${headings || "None"}
-- Rendered Page Sections & Landmarks:
-  ${sections || "None"}
-- Call-to-Action Buttons: ${buttons || "None"}
-- Navigation Links: ${links || "None"}
-- Visible Text Preview: "${pageContext.domSummary?.visibleTextSnippet?.slice(0, 1000) || "Empty"}"
-${runtimeErrorObservation(pageContext)}
-${pageContext.selectedElement ? `- Selected Element: <${pageContext.selectedElement.tag}> "${pageContext.selectedElement.text || ""}"` : ""}
-`;
-  }
-
-  const systemPrompt = `You are Lasso, a fast and helpful AI coding assistant embedded in a live web application (${framework}).
-Respond conversationally, concisely, and helpfully.
-${pageContext ? "You have live access to the browser page context. When the user asks about the page, design, layout, or components, reference the actual headings, sections, buttons, and text rendered on screen. Provide concrete, expert design and UX feedback. Never claim the page has no content or components when rendered headings and sections are present." : ""}
-Do not output code changes, file patches, or JSON schemas — just talk to the developer naturally and offer assistance.`;
-  const userPrompt = `${history ? `Conversation History:\n${history}\n\n` : ""}${pageObservation}\nUser message: ${prompt}`;
-
-  // CLI agents (Claude Code, Codex, OpenCode, Cursor) authenticate themselves, so no
-  // provider API key is needed. Failures are thrown so the caller can fall back.
-  if (isCliProvider(config.provider)) {
-    const text = await runLocalAgentPrompt(cwd, config, `${systemPrompt}\n\n${userPrompt}`, signal, onProgress, taskId, onPrompt);
-    return text.trim() || "Hello! I'm Lasso, your AI pair programmer. You can ask me questions about your project or tell me what to build, modify, or fix.";
-  }
-
-  if (!config.apiKey && config.provider !== "ollama") {
-    if (pageContext && (prompt.toLowerCase().includes("landing page") || prompt.toLowerCase().includes("page"))) {
-      const headings = (pageContext.domSummary?.headings || []).map((h: any) => `"${h.text}"`).join(", ");
-      const sections = (pageContext.domSummary?.sections || []).map((s: any) => s.name).join(", ");
-      return `Looking at your current page ("${pageContext.title}" on ${pageContext.route}):\n\n- **Rendered Sections:** ${sections || "Standard container"}\n- **Key Headings:** ${headings || "None"}\n- **CTAs:** ${(pageContext.domSummary?.buttons || []).join(", ") || "None"}\n\nTo build or refine components, run \`lasso auth login\` or add an AI provider API key in settings, then ask me what to modify!`;
-    }
-    return "Hello! I'm Lasso, your AI pair programmer. You can ask me questions about your project or tell me what to build, modify, or fix. Run `lasso auth login` (or add a provider API key in settings) to unlock AI replies.";
-  }
-
-  try {
-    const model = config.model;
-
-    if (!model) {
-      return "No model selected. Please select a model in settings.";
-    }
-
-    if (config.provider === "openai" || config.provider === "ollama" || config.provider === "nvidia") {
-      const baseUrl = config.baseUrl || (config.provider === "nvidia" ? "https://integrate.api.nvidia.com/v1" : "https://api.openai.com/v1");
-      const res = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey || ""}` },
-        body: JSON.stringify({
-          model,
-          temperature: 0.7,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      });
-      if (res.ok) {
-        const json = (await res.json()) as any;
-        const text = json.choices?.[0]?.message?.content?.trim();
-        if (text) return text;
-      }
-    } else if (config.provider === "google") {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(config.apiKey || "")}`, {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-        }),
-      });
-      if (res.ok) {
-        const json = (await res.json()) as any;
-        const text = json.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("")?.trim();
-        if (text) return text;
-      }
-    } else {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json", "x-api-key": config.apiKey || "", "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({
-          model,
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: [{ role: "user", content: userPrompt }],
-        }),
-      });
-      if (res.ok) {
-        const json = (await res.json()) as any;
-        const text = json.content?.find((item: any) => item.type === "text")?.text?.trim();
-        if (text) return text;
+  // Scan for files and directories
+  function scanDir(dir: string, base: string = "") {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relativePath = base ? path.join(base, entry.name) : entry.name;
+      
+      if (entry.isDirectory()) {
+        if (!entry.name.startsWith(".") && entry.name !== "node_modules") {
+          directories.push(relativePath);
+          scanDir(fullPath, relativePath);
+        }
+      } else {
+        files.push(relativePath);
       }
     }
-  } catch (err) {
-    console.warn("[lasso] Local conversational reply generation error:", err);
   }
 
-  return "Hello! I'm Lasso, your AI pair programmer. You can ask me questions about your project or tell me what to build, modify, or fix.";
+  scanDir(cwd);
+
+  return {
+    hasTypeScript,
+    hasReact,
+    hasNext,
+    hasVite,
+    hasTailwind,
+    files: files.slice(0, 200),
+    directories: directories.slice(0, 50),
+    dependencies,
+    devDependencies,
+    sourceRoot: fs.existsSync(path.join(cwd, "src")) ? "src" : ".",
+  };
 }
 
 export async function runOneShotAgent(
@@ -265,965 +116,171 @@ export async function runOneShotAgent(
   pageContext?: any
 ): Promise<OneShotResult> {
   const startTime = Date.now();
+  
   try {
     if (signal.aborted) {
       return { ok: false, error: "Operation was cancelled" };
     }
 
-    const isConversational = await isConversationalPrompt(prompt, config, apiKey);
-    console.log('[Lasso] Is conversational:', isConversational);
+    onProgress("thinking", "Analyzing project structure...", "Scanning files and dependencies");
 
-    // Browser inspection & snapshot steps - skip for simple conversational queries
-    // FAST CONTEXT: Skip detailed DOM analysis if pageContext is already provided
-    if (pageContext && !isConversational) {
-      onProgress(
-        "thinking",
-        "Analyzing page context...",
-        `Page: "${pageContext.title || "Landing page"}" (${pageContext.route || "/"})`
-      );
-      // Skip the slow "Scrolling & analyzing" steps - the pageContext already has the data
-      // Only show viewport info if available
-      if (pageContext.viewport) {
-        onProgress(
-          "thinking",
-          "Ready to proceed...",
-          `Viewport: ${pageContext.viewport.width}x${pageContext.viewport.height}`
-        );
-      }
-    } else {
-      onProgress("thinking", isConversational ? "Thinking..." : "Analyzing project structure...", isConversational ? undefined : "Scanning files and dependencies");
-    }
+    const projectStructure = detectProjectStructure(cwd);
+    const framework = detectFramework(cwd);
 
-    // Skip project structure analysis for simple conversational queries
-    const projectStructure = isConversational ? null : await analyzeProject(cwd);
-    const framework = isConversational ? null : detectFramework(cwd);
+    onProgress("thinking", "Inspecting application...", `Detected ${framework} framework`);
 
-    if (!isConversational && !pageContext) {
-      onProgress("thinking", "Inspecting application...", `Detected ${framework} framework`);
-    }
+    const targetServerUrl = serverUrl || config.serverUrl || "https://api.lasso.byorello.space";
+    const resolvedApiKey = apiKey || config.apiKey || config.lassoKey || "";
 
-    let rawServerUrl =
-      serverUrl ||
-      process.env.LASSO_SERVER_URL ||
-      process.env.NEXT_PUBLIC_LASSO_SERVER_URL ||
-      process.env.LASSO_API_URL ||
-      "https://api.lasso.byorello.space";
+    const runtimeClient = new RuntimeClient(targetServerUrl, resolvedApiKey || undefined);
 
-    if (rawServerUrl.includes("collab.lasso.byorello.space")) {
-      rawServerUrl = rawServerUrl.replace("collab.lasso.byorello.space", "api.lasso.byorello.space");
-    }
-    const targetServerUrl = rawServerUrl.replace(/\/$/, "").replace(/\/api\/v1$/, "");
+    onProgress("thinking", "Creating runtime session...", `Model: ${config.model || "claude-3-5-sonnet-20241022"}`);
 
-    const useCliAgent = isCliProvider(config.provider);
-    // Prioritize CLI auth credentials over env vars
-    const cliCredentials = loadCredentials();
-    const gatewayKey = cliCredentials?.apiKey || apiKey || config.lassoKey || (config.apiKey && (config.apiKey.startsWith("lss_live_") || config.apiKey.startsWith("lss_")) ? config.apiKey : "") || process.env.LASSO_API_KEY || "";
-
-    const hasLocalProviderKey = Boolean(
-      config.apiKey &&
-      config.apiKey !== "ollama" &&
-      !config.apiKey.startsWith("lss_live_") &&
-      !config.apiKey.startsWith("lss_")
-    );
-
-    // If the user has CLI auth, always route to server (unless using local agents)
-    // If the user does NOT have a local provider key in .env, route to Lasso Agent Gateway on server.
-    // When they DO have a local key in .env, it runs locally to save server resources!
-    // Ollama always runs locally (the server cannot reach the user's localhost).
-    const shouldRouteToServer = !useCliAgent && config.provider !== "ollama" && (Boolean(cliCredentials) || !hasLocalProviderKey) && Boolean(targetServerUrl);
-
-    const callGateway = async (target: { provider: AgentConfig["provider"]; model?: string }): Promise<OneShotResult> => {
-      try {
-        if (!isConversational && !pageContext) {
-          onProgress("thinking", "Connecting to Lasso Agent Gateway...", `Model: ${target.model || "claude-3-7-sonnet"}`);
-        }
-
-        const endpoint = `${targetServerUrl.replace(/\/$/, "")}/api/v1/agent/session`;
-        const headers: Record<string, string> = {
-          "content-type": "application/json",
-        };
-        const resolvedApiKey = apiKey || config.apiKey || process.env.LASSO_API_KEY;
-        if (resolvedApiKey) {
-          headers["authorization"] = `Bearer ${resolvedApiKey}`;
-        }
-
-        const controller = new AbortController();
-        const onAbort = () => controller.abort();
-        signal.addEventListener("abort", onAbort, { once: true });
-
-        // Add a 5-minute timeout for gateway requests
-        const timeout = setTimeout(() => {
-          controller.abort();
-        }, 5 * 60 * 1000);
-        timeout.unref();
-
-        // Build sourceHints: read relevant file contents to give the AI real code context.
-        // This is what enables code changes instead of "please share the file" responses.
-        const sourceHints: Record<string, string> = {};
-        if (!isConversational && projectStructure) {
-          const promptLower = prompt.toLowerCase();
-          const allCssFiles = projectStructure.files.filter((f) => /\.(css|scss)$/i.test(f));
-          const entryFiles = projectStructure.files.filter((f) =>
-            /(App|page|index|layout|main|hero|header|landing)\.(tsx|jsx|js|ts|html)$/i.test(f)
-          );
-          const mentionedFiles = projectStructure.files.filter((f) => {
-            const base = path.basename(f, path.extname(f)).toLowerCase();
-            return base.length > 2 && promptLower.includes(base);
-          });
-          const targetFiles = [...new Set([...allCssFiles, ...entryFiles, ...mentionedFiles])].slice(0, 8);
-          for (const file of targetFiles) {
-            try {
-              const content = fs.readFileSync(path.join(cwd, file), "utf8");
-              sourceHints[file] = content.slice(0, 8000);
-            } catch { /* skip unreadable files */ }
-          }
-        }
-
-        onProgress("thinking", "Contacting AI agent...", `Provider: ${target.provider}, Model: ${target.model || "default"}`);
-
-        // Use streaming request for real-time progress updates
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            ...headers,
-            "Accept": "text/event-stream",
-          },
-          signal: controller.signal,
-          body: JSON.stringify({
-            sessionId: taskId,
-            prompt,
-            messages,
-            model: {
-              id: target.model,
-              provider: target.provider,
-            },
-            context: {
-              framework: framework || undefined,
-              hasTypeScript: projectStructure?.hasTypeScript,
-              hasTailwind: projectStructure?.hasTailwind,
-              hasReact: projectStructure?.hasReact,
-              hasNext: projectStructure?.hasNext,
-              hasVite: projectStructure?.hasVite,
-              dependencies: projectStructure?.dependencies,
-              devDependencies: projectStructure?.devDependencies,
-              files: projectStructure?.files.slice(0, 100) || [],
-              directories: projectStructure?.directories.slice(0, 50) || [],
-              sourceRoot: projectStructure?.sourceRoot,
-              appRouter: projectStructure?.appRouter,
-              pagesRouter: projectStructure?.pagesRouter,
-              multipleAppDirs: projectStructure?.multipleAppDirs,
-              sourceHints: Object.keys(sourceHints).length > 0 ? sourceHints : undefined,
-              currentRoute: pageContext?.route || "/",
-              pageContext,
-            },
-          }),
-        });
-
-        signal.removeEventListener("abort", onAbort);
-
-        if (signal.aborted) {
-          return { ok: false, error: "Request timed out after 5 minutes. Your plan quota may be exhausted. Please upgrade your plan or add credits to continue using this service." };
-        }
-
-        if (!response.ok) {
-          const errText = await response.text();
-          console.error(`[Lasso] Gateway error ${response.status}:`, errText);
-          const errData = (await response.json().catch(() => ({}))) as { error?: string };
-          const errorMessage = errData.error || `Agent request failed (${response.status}): ${errText}`;
-          // Check for quota/plan exhaustion
-          if (/quota exceeded|quota limit|out of quota|no quota|plan.*limit|plan.*exhausted|credit.*exhausted|billing.*quota|rate.*limit|429|too many requests|request.*limit|insufficient.*credits|no.*credits|credits.*exhausted|payment.*required|subscription.*required|upgrade.*required|upgrade.*plan|billing.*required/i.test(errorMessage)) {
-            return { ok: false, error: "Your plan quota has been exhausted. Please upgrade your plan or add credits to continue using this service." };
-          }
-          return { ok: false, error: errorMessage };
-        }
-
-        // Process streaming response
-        const reader = response.body?.getReader();
-        if (!reader) {
-          return { ok: false, error: "Failed to read response stream" };
-        }
-
-        const decoder = new TextDecoder();
-        let buffer = "";
-        let finalData: {
-          status?: string;
-          summary?: string;
-          reply?: string;
-          thinking?: OneShotThinkingStep[];
-          totalThinkingTimeMs?: number;
-          changes?: SourceChange[];
-          error?: string;
-        } = {};
-
-        try {
-          while (true) {
-            if (signal.aborted) {
-              reader.cancel();
-              return { ok: false, error: "Request was aborted" };
-            }
-
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-
-            for (const line of lines) {
-              if (line.startsWith("data: ")) {
-                const data = line.slice(6);
-                if (data === "[DONE]") continue;
-
-                try {
-                  const event = JSON.parse(data);
-                  console.log(`[Lasso] Stream event:`, JSON.stringify({ type: event.type || "unknown" }));
-
-                  // Handle thinking steps
-                  if (event.type === "thinking" && event.step) {
-                    onProgress("thinking", event.step.title, event.step.detail);
-                  }
-
-                  // Handle tool calls
-                  if (event.type === "tool_call" && event.tool) {
-                    onProgress("working", `Using ${event.tool.name}...`, event.tool.input?.path || event.tool.input?.query || "");
-                  }
-
-                  // Handle progress messages
-                  if (event.type === "progress" && event.message) {
-                    onProgress("thinking", event.message, event.detail);
-                  }
-
-                  // Accumulate final data
-                  if (event.type === "done" || event.changes || event.summary) {
-                    finalData = { ...finalData, ...event };
-                  }
-                } catch (e) {
-                  console.warn(`[Lasso] Failed to parse stream event:`, data, e);
-                }
-              }
-            }
-          }
-        } finally {
-          reader.releaseLock();
-        }
-
-        const data = finalData;
-
-        console.log(`[Lasso] Gateway response:`, JSON.stringify({ status: data.status, hasChanges: !!data.changes, changesCount: data.changes?.length, hasReply: !!data.reply, hasError: !!data.error }));
-
-        if (data.status === "failed" || data.error) {
-          const error = data.error || data.summary || "Agent session failed on server.";
-          // Check for quota/plan exhaustion
-          if (/quota exceeded|quota limit|out of quota|no quota|plan.*limit|plan.*exhausted|credit.*exhausted|billing.*quota|rate.*limit|429|too many requests|request.*limit|insufficient.*credits|no.*credits|credits.*exhausted|payment.*required|subscription.*required|upgrade.*required|upgrade.*plan|billing.*required/i.test(error)) {
-            return { ok: false, error: "Your plan quota has been exhausted. Please upgrade your plan or add credits to continue using this service." };
-          }
-          return { ok: false, error };
-        }
-
-        if (data) {
-          const changes = Array.isArray(data.changes) ? data.changes : [];
-          const isChatReply =
-            isConversational ||
-            (typeof data.reply === "string" && data.reply.trim().length > 0 && changes.length === 0) ||
-            (changes.length === 0 && Boolean(data.summary));
-
-          if (isChatReply) {
-            // Conversational reply — no file changes needed
-            return {
-              ok: true,
-              summary: data.reply?.trim() || data.summary || "Hello! How can I help you with your project today?",
-              changes: [],
-              thinking: [],
-              totalThinkingTimeMs: data.totalThinkingTimeMs || Date.now() - startTime,
-            };
-          }
-
-          // Replay thinking steps progress for implementation (fallback if not streamed)
-          if (data.thinking && data.thinking.length) {
-            for (const step of data.thinking) {
-              if (signal.aborted) break;
-              onProgress("thinking", step.title, step.detail);
-              await new Promise((r) => setTimeout(r, 200));
-            }
-          }
-
-          if (changes.length > 0) {
-            onProgress("working", "Preparing proposed changes...", `${changes.length} files modified`);
-            return {
-              ok: true,
-              summary: data.summary || `Implemented changes for: ${prompt}`,
-              todo: Array.isArray((data as any).todo) ? (data as any).todo : undefined,
-              changes,
-              thinking: data.thinking || [
-                { title: "Project analysis", detail: `Framework: ${framework}` },
-                { title: "Component planning", detail: "Prepared changes" },
-              ],
-              totalThinkingTimeMs: data.totalThinkingTimeMs || Date.now() - startTime,
-            };
-          }
-
-          // Server returned 200 but no changes and no reply — surface a clear error
-          return {
-            ok: false,
-            error: "The agent couldn't generate changes for that request. Try rephrasing or check your AI provider key in the dashboard.",
-          };
-        }
-      } catch (serverErr) {
-        return {
-          ok: false,
-          error: serverErr instanceof Error ? serverErr.message : "Failed to connect to Lasso Agent Gateway.",
-        };
-      }
-      return { ok: false, error: "The agent session returned no result." };
+    const sessionInput: RuntimeSessionInput = {
+      userPrompt: prompt,
+      project: {
+        projectId: "", // TODO: Get from workspace config
+        framework,
+        hasTypeScript: projectStructure.hasTypeScript,
+        hasReact: projectStructure.hasReact,
+        hasNext: projectStructure.hasNext,
+        hasVite: projectStructure.hasVite,
+        files: projectStructure.files.slice(0, 100),
+        currentRoute: pageContext?.route || "/",
+      },
+      model: {
+        provider: config.provider as any,
+        id: config.model || "claude-3-5-sonnet-20241022",
+      },
+      selection: pageContext ? {
+        element: pageContext.selectedElement ? {
+          tag: pageContext.selectedElement.tag,
+          text: pageContext.selectedElement.text,
+          source: pageContext.selectedElement.source,
+          attributes: pageContext.selectedElement.attributes,
+        } : undefined,
+        viewport: pageContext.viewport,
+        route: pageContext.route,
+        screenshot: pageContext.screenshot,
+      } : undefined,
     };
 
-    const gatewayFallback = async (reason: string): Promise<OneShotResult> => {
-      if (!gatewayKey || !targetServerUrl) {
-        return {
-          ok: false,
-          error: `${reason} — run \`${cliCommand(config.provider)}\` once to authenticate it, or run \`lasso auth login\` to use the Lasso gateway.`,
-        };
+    const session = await runtimeClient.createSession(sessionInput);
+
+    const thinkingSteps: OneShotThinkingStep[] = [];
+    let changes: SourceChange[] = [];
+
+    await runtimeClient.runSession(session.id, cwd, (event: RuntimeEvent) => {
+      if (signal.aborted) return;
+
+      switch (event.type) {
+        case "agent_started":
+          onProgress("thinking", "Agent started", "Initializing runtime");
+          break;
+
+        case "agent_reasoning":
+          const summary = (event.data as any).summary || "Thinking...";
+          thinkingSteps.push({ title: summary, durationMs: 0 });
+          onProgress("thinking", summary);
+          break;
+
+        case "tool_started":
+          const tool = (event.data as any).tool || "tool";
+          onProgress("working", `Running ${tool}...`);
+          break;
+
+        case "tool_completed":
+          onProgress("working", "Tool completed");
+          break;
+
+        case "phase_changed":
+          const phase = (event.data as any).phase;
+          onProgress("working", `Phase: ${phase}`);
+          break;
+
+        case "verification_started":
+          onProgress("review", "Verifying changes...");
+          break;
+
+        case "verification_completed":
+          const passed = (event.data as any).success ?? (event.data as any).passed;
+          onProgress(passed ? "working" : "error", passed ? "Verification passed" : "Verification failed");
+          break;
+
+        case "waiting_for_user":
+          const question = (event as any).data?.question || "Input required";
+          onPrompt({ question });
+          break;
+
+        case "error":
+          onProgress("error", (event.data as any).error || "Unknown error");
+          break;
       }
-      onProgress("thinking", `${cliLabel(config.provider)} is unavailable; using the Lasso Agent Gateway...`, reason);
-      const target = gatewayTargetForCli(config.provider, config.model);
-      const result = await callGateway({ provider: target.provider, model: target.model });
-      if (!result.ok && result.error) {
-        return { ok: false, error: `${reason} — gateway fallback failed: ${result.error}` };
-      }
-      return result;
-    };
+    }, signal);
 
-    // CLI agents (Claude Code, Codex, OpenCode, Cursor) authenticate themselves, so they run
-    // locally first instead of demanding a provider API key from settings.
-    if (useCliAgent && !isConversational) {
-      onProgress("thinking", `Running ${cliLabel(config.provider)}...`, `Local CLI agent · ${config.model || ""}`);
-      try {
-        const selectedElement = pageContext?.selectedElement;
-        const input: AgentInput = {
-          taskId,
-          instruction: prompt,
-          model: config.model || "",
-          messages,
-          context: {
-            runtimeErrors: pageContext?.runtimeErrors,
-            screenshots: pageContext?.screenshot ? { full: pageContext.screenshot } : undefined,
-            viewport: pageContext?.viewport,
-          },
-          element: {
-            tag: selectedElement?.tag || "project",
-            group: scope === "component" ? "component" : "workspace",
-            label: selectedElement?.text || "project",
-            html: selectedElement ? `<${selectedElement.tag}> ${selectedElement.text || ""}` : undefined,
-          },
-        };
-        const proposal = await proposeChanges(
-          cwd,
-          input,
-          config,
-          signal,
-          (message, detail, level) => {
-            onProgress(level === "error" ? "error" : "working", message, detail);
-          },
-          (agentPrompt) => {
-            onPrompt({ question: agentPrompt.message, options: agentPrompt.options });
-          }
-        );
-
-        if (signal.aborted) {
-          return { ok: false, error: "Operation was cancelled" };
-        }
-
-        if (!proposal.changes.length) {
-          return { ok: true, summary: proposal.summary, changes: [], thinking: [], totalThinkingTimeMs: Date.now() - startTime };
-        }
-
-        onProgress("review", "Implementation complete", `${proposal.changes.length} files modified`);
-        return {
-          ok: true,
-          summary: proposal.summary,
-          changes: proposal.changes,
-          thinking: [
-            { title: "Analyzed project structure", detail: `Detected ${framework} framework` },
-            { title: `${cliLabel(config.provider)} generated a proposal`, detail: `${proposal.changes.length} file(s)` },
-          ],
-          totalThinkingTimeMs: Date.now() - startTime,
-        };
-      } catch (err) {
-        if (signal.aborted) {
-          return { ok: false, error: "Operation was cancelled" };
-        }
-        return await gatewayFallback(err instanceof Error ? err.message : `${cliLabel(config.provider)} failed`);
-      }
-    }
-
-    if (useCliAgent && isConversational) {
-      try {
-        const reply = await generateConversationalReply(
-          cwd,
-          prompt,
-          framework || "",
-          config,
-          signal,
-          messages,
-          pageContext,
-          (message, detail) => onProgress("thinking", message, detail),
-          taskId,
-          (agentPrompt) => onPrompt({ question: agentPrompt.message, options: agentPrompt.options })
-        );
-        return {
-          ok: true,
-          summary: reply,
-          changes: [],
-          thinking: [],
-          totalThinkingTimeMs: Date.now() - startTime,
-        };
-      } catch (err) {
-        if (signal.aborted) {
-          return { ok: false, error: "Operation was cancelled" };
-        }
-        return await gatewayFallback(err instanceof Error ? err.message : `${cliLabel(config.provider)} failed`);
-      }
-    }
-
-    if (shouldRouteToServer) {
-      return await callGateway({ provider: config.provider, model: config.model });
-    }
-
-    // If it's a conversational prompt and server was not used or failed, respond directly without modifying files!
-    if (isConversational) {
-      const reply = await generateConversationalReply(cwd, prompt, framework || "", config, signal, messages, pageContext);
-      return {
-        ok: true,
-        summary: reply,
-        changes: [],
-        thinking: [],
-        totalThinkingTimeMs: Date.now() - startTime,
-      };
-    }
-
-    // Phase 2: Local agent generation fallback for code changes
-    onProgress("thinking", "Generating implementation plan...", `Planning components for ${prompt}`);
-    const plan = await generatePlan(cwd, prompt, scope, projectStructure || { framework: "", hasTypeScript: false, hasTailwind: false, hasReact: false, hasNext: false, hasVite: false, dependencies: [], devDependencies: [], files: [], directories: [], sourceRoot: ".", appRouter: false, pagesRouter: false, multipleAppDirs: [] }, framework || "", config, signal, messages, pageContext);
-
-    if (signal.aborted) {
-      return { ok: false, error: "Operation was cancelled during planning" };
-    }
-
-    if (plan.isConversational || (plan.reply && (!plan.steps || plan.steps.length === 0))) {
-      return {
-        ok: true,
-        summary: plan.reply || "How can I help you with your project?",
-        changes: [],
-        thinking: [],
-        totalThinkingTimeMs: Date.now() - startTime,
-      };
-    }
-
-    if (!plan.steps.length) {
-      return {
-        ok: false,
-        error: "Could not generate file modifications. Check your AI provider configuration or prompt clarity.",
-      };
-    }
-
-    onProgress("thinking", "Execution plan ready", `${plan.steps.length} steps identified`);
-
-    // Phase 3: Execute plan step by step
-    const allChanges: SourceChange[] = [];
-    const thinkingSteps: OneShotThinkingStep[] = [
-      { title: "Analyzed project structure", detail: `Detected ${framework} framework` },
-      { title: "Formulated execution steps", detail: `${plan.steps.length} steps planned` },
-    ];
-
-    for (let i = 0; i < plan.steps.length; i++) {
-      if (signal.aborted) {
-        return { ok: false, error: "Operation was cancelled during execution" };
-      }
-
-      const step = plan.steps[i];
-      onProgress("working", `Step ${i + 1}/${plan.steps.length}: ${step.description}`, step.detail || "");
-      thinkingSteps.push({ title: step.description, detail: step.detail });
-
-      const stepResult = await executeStep(cwd, step, config, signal, onProgress, onPrompt);
-
-      if (!stepResult.ok) {
-        return { ok: false, error: `Failed at step ${i + 1}: ${stepResult.error}` };
-      }
-
-      if (stepResult.changes) {
-        allChanges.push(...stepResult.changes);
-      }
-
-      onProgress("working", `Step ${i + 1}/${plan.steps.length} complete`, step.description);
-    }
-
-    // Phase 4: Validate
-    onProgress("working", "Validating changes...", "Checking syntax and structure");
-    thinkingSteps.push({ title: "Validating changes", detail: "Checked syntax and file structure" });
+    // Get final session state to extract changes
+    const finalSession = await runtimeClient.getSession(session.id);
+    changes = extractChangesFromSession(finalSession);
 
     const totalThinkingTimeMs = Date.now() - startTime;
 
-    onProgress("review", "Implementation complete", `${allChanges.length} files modified`);
-
     return {
       ok: true,
-      summary: plan.summary || `Implemented changes for: ${prompt}`,
-      todo: plan.todo,
-      changes: allChanges,
+      summary: "Task completed",
+      changes,
       thinking: thinkingSteps,
       totalThinkingTimeMs,
     };
   } catch (error) {
-    const reason = error instanceof Error ? error.message : "Unknown error";
-    return { ok: false, error: `One-shot agent failed: ${reason}` };
-  }
-}
-
-function extractJson(text: string): any {
-  try {
-    return JSON.parse(text);
-  } catch {}
-  const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (match) {
-    try {
-      return JSON.parse(match[1]);
-    } catch {}
-  }
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    try {
-      return JSON.parse(text.slice(firstBrace, lastBrace + 1));
-    } catch {}
-  }
-  return null;
-}
-
-interface ProjectStructure {
-  framework: string;
-  hasTypeScript: boolean;
-  hasTailwind: boolean;
-  hasReact: boolean;
-  hasNext: boolean;
-  hasVite: boolean;
-  dependencies: string[];
-  devDependencies: string[];
-  files: string[];
-  directories: string[];
-  sourceRoot: string;
-  appRouter: boolean;
-  pagesRouter: boolean;
-  multipleAppDirs: string[];
-}
-
-async function analyzeProject(cwd: string): Promise<ProjectStructure> {
-  const pkgPath = path.join(cwd, "package.json");
-  const pkg = fs.existsSync(pkgPath) ? JSON.parse(fs.readFileSync(pkgPath, "utf8")) : {};
-
-  const dependencies = Object.keys(pkg.dependencies || {});
-  const devDependencies = Object.keys(pkg.devDependencies || {});
-
-  const hasTypeScript =
-    dependencies.includes("typescript") ||
-    devDependencies.includes("typescript") ||
-    fs.existsSync(path.join(cwd, "tsconfig.json"));
-  const hasTailwind = dependencies.includes("tailwindcss") || devDependencies.includes("tailwindcss");
-  const hasReact = dependencies.includes("react") || devDependencies.includes("react");
-  const hasNext = dependencies.includes("next") || devDependencies.includes("next");
-  const hasVite = dependencies.includes("vite") || devDependencies.includes("vite");
-
-  // FAST CONTEXT: Only scan top-level directories, not full recursive scan
-  // This is the key optimization - let the server-side agent handle file discovery
-  const files: string[] = [];
-  const directories: string[] = [];
-  const appDirs: string[] = [];
-  const pagesDirs: string[] = [];
-
-  const roots = ["src", "app", "pages", "components", "lib"];
-  for (const root of roots) {
-    const rootPath = path.join(cwd, root);
-    if (!fs.existsSync(rootPath)) continue;
-
-    // Only scan top-level (depth 0-1), not recursive
-    try {
-      const entries = fs.readdirSync(rootPath, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.name.startsWith(".") || entry.name === "node_modules") {
-          continue;
-        }
-        const rel = entry.name;
-        if (entry.isDirectory()) {
-          directories.push(rel);
-          // Track app and pages directories at top level
-          if (entry.name === "app") appDirs.push(rel);
-          if (entry.name === "pages") pagesDirs.push(rel);
-          // Only scan one level deep for key directories
-          if (["components", "lib", "hooks", "utils", "styles"].includes(entry.name)) {
-            try {
-              const subEntries = fs.readdirSync(path.join(rootPath, entry.name), { withFileTypes: true });
-              for (const subEntry of subEntries) {
-                if (!subEntry.name.startsWith(".") && !subEntry.isDirectory() && /\.(tsx?|jsx?|vue|svelte|css)$/i.test(subEntry.name)) {
-                  files.push(path.join(rel, subEntry.name));
-                }
-              }
-            } catch {
-              // ignore scan errors
-            }
-          }
-        } else if (/\.(tsx?|jsx?|vue|svelte|css|html|json)$/i.test(entry.name)) {
-          files.push(rel);
-        }
-      }
-    } catch {
-      // ignore scan errors
-    }
-    if (files.length > 20) break; // Limit to 20 files for fast context
-  }
-
-  // Also check root directory for key files
-  try {
-    const rootEntries = fs.readdirSync(cwd, { withFileTypes: true });
-    for (const entry of rootEntries) {
-      if (!entry.isDirectory() && /\.(tsx?|jsx?|vue|svelte|css|html|json)$/i.test(entry.name)) {
-        files.push(entry.name);
-      }
-    }
-  } catch {
-    // ignore scan errors
-  }
-
-  // Determine source root
-  let sourceRoot = ".";
-  if (directories.includes("src/app")) sourceRoot = "src";
-  else if (directories.includes("app")) sourceRoot = ".";
-  else if (directories.includes("src")) sourceRoot = "src";
-
-  // Detect App Router vs Pages Router (lightweight check)
-  const appRouter = appDirs.length > 0 && fs.existsSync(path.join(cwd, "app", "layout.tsx")) || fs.existsSync(path.join(cwd, "app", "page.tsx"));
-  const pagesRouter = pagesDirs.length > 0 && (fs.existsSync(path.join(cwd, "pages", "_app.tsx")) || fs.existsSync(path.join(cwd, "pages", "_document.tsx")));
-
-  return {
-    framework: detectFramework(cwd),
-    hasTypeScript,
-    hasTailwind,
-    hasReact,
-    hasNext,
-    hasVite,
-    dependencies: dependencies as string[],
-    devDependencies: devDependencies as string[],
-    files,
-    directories,
-    sourceRoot,
-    appRouter,
-    pagesRouter,
-    multipleAppDirs: appDirs,
-  };
-}
-
-interface ExecutionPlan {
-  summary?: string;
-  reply?: string;
-  isConversational?: boolean;
-  todo?: Array<{
-    file: string;
-    action: "modify" | "create" | "delete";
-    reason: string;
-  }>;
-  steps: Array<{
-    description: string;
-    detail?: string;
-    type: "install" | "create" | "modify" | "delete" | "command";
-    target?: string;
-    content?: string;
-    command?: string;
-  }>;
-}
-
-async function generatePlan(
-  cwd: string,
-  prompt: string,
-  _scope: "project" | "component",
-  structure: ProjectStructure,
-  framework: string,
-  config: AgentConfig,
-  signal: AbortSignal,
-  _messages?: ConversationMessage[],
-  pageContext?: any
-): Promise<ExecutionPlan> {
-  const steps: ExecutionPlan["steps"] = [];
-
-  // Identify relevant files to supply as context.
-  // Priority 1: Any CSS / SCSS files (global styles are the most common source of regressions)
-  // Priority 2: Core app entry points
-  // Priority 3: Any component mentioned by keyword in the prompt
-  const promptLower = prompt.toLowerCase();
-  const allCssFiles = structure.files.filter((f) => /\.(css|scss)$/i.test(f));
-  const entryFiles = structure.files.filter((f) =>
-    /(App|page|index|layout|main)\.(tsx|jsx|js|ts|html)$/i.test(f)
-  );
-  // Pull component files whose filename appears in the user prompt
-  const mentionedFiles = structure.files.filter((f) => {
-    const base = path.basename(f, path.extname(f)).toLowerCase();
-    return base.length > 2 && promptLower.includes(base);
-  });
-  const targetFiles = [...new Set([...allCssFiles, ...entryFiles, ...mentionedFiles])].slice(0, 8);
-
-  const fileSnippets = targetFiles.map((f) => {
-    try {
-      const content = fs.readFileSync(path.join(cwd, f), "utf8");
-      return `File: ${f}\n\`\`\`\n${content.slice(0, 8000)}\n\`\`\``;
-    } catch {
-      return "";
-    }
-  }).filter(Boolean).join("\n\n");
-
-  let pageObservation = "";
-  if (pageContext) {
-    const headings = (pageContext.domSummary?.headings || []).map((h: any) => `H${h.level}: "${h.text}"`).join("\n  ");
-    const sections = (pageContext.domSummary?.sections || []).map((s: any) => `- [${s.name}]: ${s.textPreview}`).join("\n  ");
-    const buttons = (pageContext.domSummary?.buttons || []).join(", ");
-    pageObservation = `
-Live Browser Page Context (currently rendered):
-- Route: ${pageContext.route || "/"}
-- Title: "${pageContext.title || "Untitled"}"
-- Viewport: ${pageContext.viewport?.width}x${pageContext.viewport?.height} (Height: ${pageContext.viewport?.scrollHeight}px)
-- Rendered Headings: ${headings || "None"}
-- Rendered Sections: ${sections || "None"}
-- Action Buttons: ${buttons || "None"}
-${runtimeErrorObservation(pageContext)}
-`;
-  }
-
-  const systemPrompt = `You are Lasso's Agentic Coding Agent embedded in a live ${framework} web app.
-All project files: ${structure.files.slice(0, 50).join(", ")}
-
-## CRITICAL RULES — read before generating anything:
-1. You will receive the full content of ALL CSS/style files. Treat them as ground truth for the design system. Do NOT rewrite, restructure, or remove existing CSS classes — only add new rules or make targeted changes the user explicitly asked for.
-2. Before writing any code, declare your TASK SCOPE: the exact list of files you will touch. You must NOT modify any file outside this scope.
-3. When modifying an existing file, output the COMPLETE updated file content — never partial snippets.
-4. If the user's request only affects one component, do not touch global stylesheets or unrelated files.
-5. If the Live Browser Page Context lists console/runtime errors, treat fixing them as part of this task (a broken import or undefined export means the page is dead) and never propose code that would produce new ones.
-
-Analyze the user's request.
-If the request is a general question, explanation, greeting, or does not require file modifications, return strictly valid JSON:
-{
-  "isConversational": true,
-  "reply": "Clear, friendly, conversational answer or explanation"
-}
-
-If the request asks to build, modify, create, fix, style, or refactor code, return strictly valid JSON:
-{
-  "isConversational": false,
-  "summary": "Clear, concise user-facing description of what was changed",
-  "todo": [
-    {
-      "file": "relative/file/path.tsx",
-      "action": "modify" | "create" | "delete",
-      "reason": "One sentence explaining exactly what will change and why"
-    }
-  ],
-  "steps": [
-    {
-      "type": "install" | "modify" | "create",
-      "target": "package name (e.g. '@iconify/react @hugeicons/react' for install) or relative/file/path.tsx",
-      "description": "Short action title",
-      "detail": "Brief detail",
-      "content": "The full complete new or updated file content (required for modify/create, omit for install)"
-    }
-  ]
-}
-
-If any third-party npm libraries or packages are needed, add an "install" step first before modifying or creating components.`;
-
-  const userPrompt = `User Request: ${prompt}
-${pageObservation}
-Existing code context (study these carefully before writing — especially the CSS files):
-${fileSnippets || "No existing components found. Create appropriate files in src/."}
-
-Analyze the existing code structure, then respond in JSON:`;
-
-  if (!config.apiKey && config.provider !== "ollama" && !isCliProvider(config.provider)) {
+    console.error("[Lasso] OneShot error:", error);
     return {
-      steps: [],
-      isConversational: true,
-      reply: "I couldn't generate code because no AI provider is available. Run `lasso auth login` to use your Lasso account, or add an AI provider API key in settings, then try again.",
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown error",
     };
   }
-
-  try {
-    const model = config.model;
-
-    if (!model) {
-      return {
-        steps: [],
-        isConversational: true,
-        reply: "No model selected. Please select a model in settings.",
-      };
-    }
-
-    let text = "";
-
-    if (config.provider === "openai" || config.provider === "ollama" || config.provider === "nvidia") {
-      const baseUrl = config.baseUrl || (config.provider === "nvidia" ? "https://integrate.api.nvidia.com/v1" : "https://api.openai.com/v1");
-      const res = await fetch(`${baseUrl}/chat/completions`, {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json", authorization: `Bearer ${config.apiKey || ""}` },
-        body: JSON.stringify({
-          model,
-          temperature: 0.1,
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-        }),
-      });
-      if (res.ok) {
-        const json = await res.json() as any;
-        text = json.choices?.[0]?.message?.content || "";
-      }
-    } else if (config.provider === "google") {
-      const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(config.apiKey || "")}`, {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-        }),
-      });
-      if (res.ok) {
-        const json = await res.json() as any;
-        text = json.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
-      }
-    } else {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        signal,
-        headers: { "content-type": "application/json", "x-api-key": config.apiKey || "", "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({
-          model,
-          max_tokens: 4096,
-          system: systemPrompt,
-          messages: [{ role: "user", content: userPrompt }],
-        }),
-      });
-      if (res.ok) {
-        const json = await res.json() as any;
-        text = json.content?.find((item: any) => item.type === "text")?.text || "";
-      }
-    }
-
-    const parsed = extractJson(text);
-    if (parsed) {
-      if (parsed.isConversational || (typeof parsed.reply === "string" && (!parsed.steps || parsed.steps.length === 0))) {
-        return {
-          steps: [],
-          isConversational: true,
-          reply: parsed.reply || text.trim(),
-        };
-      }
-      if (Array.isArray(parsed.steps) && parsed.steps.length > 0) {
-        return {
-          steps: parsed.steps,
-          summary: parsed.summary,
-          todo: Array.isArray(parsed.todo) ? parsed.todo : undefined,
-        };
-      }
-    }
-
-    if (text.trim().length > 0) {
-      return {
-        steps: [],
-        isConversational: true,
-        reply: text.trim(),
-      };
-    }
-  } catch (err) {
-    console.warn("[lasso] Local agent generation failed:", err);
-  }
-
-  return { steps };
 }
 
-interface StepResult {
-  ok: boolean;
-  changes?: SourceChange[];
-  error?: string;
-}
+function extractChangesFromSession(session: any): SourceChange[] {
+  if (!session) return [];
 
-async function executeStep(
-  cwd: string,
-  step: ExecutionPlan["steps"][0],
-  _config: AgentConfig,
-  signal: AbortSignal,
-  _onProgress: ProgressCallback,
-  _onPrompt: PromptCallback
-): Promise<StepResult> {
-  if (signal.aborted) {
-    return { ok: false, error: "Cancelled" };
+  const pending = session.metadata?.pendingChanges;
+  if (Array.isArray(pending) && pending.length > 0) {
+    return pending.map((change: any) => ({
+      filePath: change.filePath ?? change.path,
+      oldString: change.oldString ?? "",
+      newString: change.newString ?? "",
+      operation: change.operation ||
+        (change.oldString === "" && change.newString === "" ? "deleted" : change.oldString === "" ? "created" : "modified"),
+    }));
   }
 
-  switch (step.type) {
-    case "install":
-      if (step.target) {
-        let cmd = "npm install";
-        try {
-          if (fs.existsSync(path.join(cwd, "bun.lockb")) || fs.existsSync(path.join(cwd, "bun.lock"))) cmd = "bun add";
-          else if (fs.existsSync(path.join(cwd, "pnpm-lock.yaml"))) cmd = "pnpm add";
-          else if (fs.existsSync(path.join(cwd, "yarn.lock"))) cmd = "yarn add";
-        } catch {}
-        const commandStr = `${cmd} ${step.target}`;
-        _onProgress("working", `Installing ${step.target}…`, commandStr);
-        await execAsync(commandStr, { cwd, timeout: 120000 });
-      }
-      return { ok: true };
-
-    case "create":
-      if (step.target && step.content) {
-        const filePath = path.join(cwd, step.target);
-        const dir = path.dirname(filePath);
-        fs.mkdirSync(dir, { recursive: true });
-        return {
-          ok: true,
-          changes: [
-            {
-              filePath: step.target,
-              oldString: "",
-              newString: step.content,
-            },
-          ],
-        };
-      }
-      return { ok: false, error: "Missing target or content for create step" };
-
-    case "modify":
-      if (step.target && step.content) {
-        const filePath = path.join(cwd, step.target);
-        if (fs.existsSync(filePath)) {
-          const oldContent = fs.readFileSync(filePath, "utf8");
-          return {
-            ok: true,
-            changes: [
-              {
-                filePath: step.target,
-                oldString: oldContent,
-                newString: step.content,
-              },
-            ],
-          };
-        }
-        return { ok: false, error: `File not found: ${step.target}` };
-      }
-      return { ok: false, error: "Missing target or content for modify step" };
-
-    case "delete":
-      return { ok: true };
-
-    case "command":
-      return { ok: true };
-
-    default:
-      return { ok: true };
+  const changes: SourceChange[] = [];
+  for (const action of session.actions || []) {
+    if (!action.data) continue;
+    const filePath = action.data.filePath ?? action.data.path;
+    if (!filePath) continue;
+    if (action.type === "edit_file") {
+      changes.push({
+        filePath,
+        oldString: action.data.oldString ?? "",
+        newString: action.data.newString ?? "",
+        operation: "modified",
+      });
+    } else if (action.type === "create_file") {
+      changes.push({
+        filePath,
+        oldString: "",
+        newString: action.data.content || "",
+        operation: "created",
+      });
+    } else if (action.type === "delete_file") {
+      changes.push({
+        filePath,
+        oldString: action.data.oldContent ?? "(deleted)",
+        newString: "",
+        operation: "deleted",
+      });
+    }
   }
+  return changes;
 }

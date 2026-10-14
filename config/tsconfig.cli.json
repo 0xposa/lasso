@@ -10,12 +10,12 @@
     "lib": ["ES2022"],
     "types": ["node"],
     "tsBuildInfoFile": "../node_modules/.tmp/tsconfig.cli.tsbuildinfo", //
-    "outDir": "../dist/cli", //
-    "rootDir": "../src/cli", //
+    "outDir": "../dist", //
+    "rootDir": "../src", //
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
   },
-  "include": ["../src/cli/**/*"] //
+  "include": ["../src/cli/**/*", "../src/runtime/**/*"] //
 }

@@ -129,7 +129,6 @@ void (async () => {
   try {
     await waitForNext(nextPort, nextProcess);
   } catch (error) {
-    bridge.close();
     nextProcess.kill("SIGTERM");
     throw error;
   }
@@ -137,7 +136,6 @@ void (async () => {
   server.listen(publicPort, "127.0.0.1");
 
   const shutdown = () => {
-    bridge.close();
     nextProcess.kill("SIGTERM");
     proxy.close();
     server.close(() => process.exit(0));

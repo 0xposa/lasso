@@ -14,6 +14,7 @@ export type FileSnapshot = {
 export type TimelineSnapshot = {
   id: string;
   taskId: string;
+  sessionId?: string; // Runtime session ID
   summary: string;
   files: FileSnapshot[];
   createdAt: string;
@@ -80,7 +81,8 @@ export function createSnapshot(
   taskId: string,
   summary: string,
   filePaths: string[],
-  parentSnapshotId?: string
+  parentSnapshotId?: string,
+  sessionId?: string
 ): TimelineSnapshot {
   ensureSnapshotsDir(cwd);
 
@@ -113,6 +115,7 @@ export function createSnapshot(
   const snapshot: TimelineSnapshot = {
     id: snapshotId,
     taskId,
+    sessionId,
     summary,
     files,
     createdAt: timestamp,
@@ -265,6 +268,12 @@ export function clearSnapshots(cwd: string): void {
 export function getSnapshotByTaskId(cwd: string, taskId: string): TimelineSnapshot | undefined {
   const timeline = loadTimeline(cwd);
   return timeline.find((s) => s.taskId === taskId);
+}
+
+// Get snapshot by session ID
+export function getSnapshotBySessionId(cwd: string, sessionId: string): TimelineSnapshot | undefined {
+  const timeline = loadTimeline(cwd);
+  return timeline.find((s) => s.sessionId === sessionId);
 }
 
 // Get latest snapshot

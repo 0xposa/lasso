@@ -5,7 +5,7 @@ import openaiIcon from "@iconify-icons/logos/openai-icon";
 import nvidiaIcon from "@iconify-icons/logos/nvidia";
 import terminalIcon from "@iconify-icons/logos/terminal";
 
-import { state, rememberModel, loadChatHistory, saveChatHistory } from "../state";
+import { state, rememberModel, loadChatHistory, saveChatHistory, timeAgo } from "../state";
 import {
   appendTaskMessage,
   createAgentTask,
@@ -1099,10 +1099,17 @@ export function showReview(changes: PendingChange[], summary: string) {
       code.className = "lasso-review-code";
       const oldCode = document.createElement("pre");
       oldCode.className = "lasso-review-old";
-      oldCode.textContent = `- ${change.oldString}`;
       const newCode = document.createElement("pre");
       newCode.className = "lasso-review-new";
-      newCode.textContent = `+ ${change.newString}`;
+      const isDelete = change.operation === "deleted" || (change.newString === "" && change.oldString !== "");
+      if (isDelete) {
+        oldCode.textContent = `- ${change.oldString}`;
+        newCode.textContent = "(file deleted)";
+        newCode.classList.add("lasso-review-deleted");
+      } else {
+        oldCode.textContent = change.oldString ? `- ${change.oldString}` : "(new file)";
+        newCode.textContent = change.newString ? `+ ${change.newString}` : "";
+      }
       code.append(oldCode, newCode);
       file.append(name, code);
       return file;

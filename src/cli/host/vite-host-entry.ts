@@ -25,7 +25,7 @@ function lassoOverlayPlugin() {
 }
 
 void (async () => {
-  const bridge = await startBridge(cwd, null, bridgePort);
+  await startBridge(cwd, null, bridgePort);
   const require = createRequire(path.join(cwd, "package.json"));
   const viteEntry = require.resolve("vite");
   const { createServer } = await import(pathToFileURL(viteEntry).href);
@@ -49,11 +49,9 @@ void (async () => {
 
   await server.listen();
   process.on("SIGTERM", () => {
-    bridge.close();
     void server.close().then(() => process.exit(0));
   });
   process.on("SIGINT", () => {
-    bridge.close();
     void server.close().then(() => process.exit(0));
   });
 })();

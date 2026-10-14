@@ -11,7 +11,6 @@ import {
   refreshModelMenu,
   syncModelMenu,
   showAgentPrompt,
-  showConflict,
   showTimeline,
 } from "../prompt/prompt";
 import { setDragCardStatus, resetDrag } from "../drag/drag";
@@ -26,7 +25,7 @@ import {
   updateEmptyStateUserName,
   populateModelMenu,
 } from "../commandbar/commandbar";
-import type { GitState, ModelOption, PendingChange, ConflictInfo } from "../types";
+import type { GitState, ModelOption, PendingChange, TimelineSnapshot } from "../types";
 
 export function reportRuntimeError(details: string, notifyBridge = true) {
   const clean = details.slice(0, 1200);
@@ -123,6 +122,7 @@ export function connectBridge() {
           project?: string;
           collab?: { projectId?: string; realtimeUrl?: string; name?: string; version?: string; workspaceId?: string; token?: string; apiKey?: string; plan?: string; configuredProviders?: string[] };
           user?: { name?: string; email?: string } | null;
+          snapshots?: TimelineSnapshot[];
         };
 
         if (message.type === "config") {
@@ -322,7 +322,6 @@ export function connectBridge() {
           }
           if (isPromptTask) {
             closeReview();
-            closeConflict(); // Also close conflict panel if open
             resetDrag(false);
             state.pendingChanges = [];
           }
