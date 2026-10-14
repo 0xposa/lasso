@@ -490,32 +490,6 @@ export async function fetchModels(fileEnv: Record<string, string>): Promise<Mode
         }
 
         const body = await response.json() as ModelsResponse;
-
-        // Filter NVIDIA models to only include active, non-deprecated, structured data models
-        // Exclude embedding models and deprecated models
-        body.nvidia = body.nvidia.filter((model) => {
-            const idLower = model.id.toLowerCase();
-            const nameLower = model.name.toLowerCase();
-
-            // Exclude embedding models
-            if (idLower.includes("embed") || nameLower.includes("embed")) {
-                return false;
-            }
-
-            // Exclude deprecated models
-            if (idLower.includes("deprecated") || nameLower.includes("deprecated")) {
-                return false;
-            }
-
-            // Only include models that support structured data generation (chat/completion)
-            // Most NVIDIA chat models have "chat" or "instruct" in the name or capabilities
-            const isChatModel = idLower.includes("chat") || idLower.includes("instruct") ||
-                              nameLower.includes("chat") || nameLower.includes("instruct") ||
-                              model.capabilities?.includes("chat") || model.capabilities?.includes("completion");
-
-            return isChatModel;
-        });
-
         return body;
     } catch {
         return { anthropic: [], openai: [], google: [], nvidia: [] };

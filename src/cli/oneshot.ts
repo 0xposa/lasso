@@ -381,9 +381,13 @@ export async function runOneShotAgent(
 
         onProgress("thinking", "Contacting AI agent...", `Provider: ${target.provider}, Model: ${target.model || "default"}`);
 
+        // Use streaming request for real-time progress updates
         const response = await fetch(endpoint, {
           method: "POST",
-          headers,
+          headers: {
+            ...headers,
+            "Accept": "text/event-stream",
+          },
           signal: controller.signal,
           body: JSON.stringify({
             sessionId: taskId,
@@ -415,7 +419,6 @@ export async function runOneShotAgent(
           }),
         });
 
-        clearTimeout(timeout);
         signal.removeEventListener("abort", onAbort);
 
         if (signal.aborted) {
@@ -434,7 +437,15 @@ export async function runOneShotAgent(
           return { ok: false, error: errorMessage };
         }
 
-        const data = (await response.json()) as {
+        // Process streaming response
+        const reader = response.body?.getReader();
+        if (!reader) {
+          return { ok: false, error: "Failed to read response stream" };
+        }
+
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let finalData: {
           status?: string;
           summary?: string;
           reply?: string;
@@ -442,7 +453,61 @@ export async function runOneShotAgent(
           totalThinkingTimeMs?: number;
           changes?: SourceChange[];
           error?: string;
-        };
+        } = {};
+
+        try {
+          while (true) {
+            if (signal.aborted) {
+              reader.cancel();
+              return { ok: false, error: "Request was aborted" };
+            }
+
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                const data = line.slice(6);
+                if (data === "[DONE]") continue;
+
+                try {
+                  const event = JSON.parse(data);
+                  console.log(`[Lasso] Stream event:`, JSON.stringify({ type: event.type || "unknown" }));
+
+                  // Handle thinking steps
+                  if (event.type === "thinking" && event.step) {
+                    onProgress("thinking", event.step.title, event.step.detail);
+                  }
+
+                  // Handle tool calls
+                  if (event.type === "tool_call" && event.tool) {
+                    onProgress("working", `Using ${event.tool.name}...`, event.tool.input?.path || event.tool.input?.query || "");
+                  }
+
+                  // Handle progress messages
+                  if (event.type === "progress" && event.message) {
+                    onProgress("thinking", event.message, event.detail);
+                  }
+
+                  // Accumulate final data
+                  if (event.type === "done" || event.changes || event.summary) {
+                    finalData = { ...finalData, ...event };
+                  }
+                } catch (e) {
+                  console.warn(`[Lasso] Failed to parse stream event:`, data, e);
+                }
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+
+        const data = finalData;
 
         console.log(`[Lasso] Gateway response:`, JSON.stringify({ status: data.status, hasChanges: !!data.changes, changesCount: data.changes?.length, hasReply: !!data.reply, hasError: !!data.error }));
 
@@ -473,7 +538,7 @@ export async function runOneShotAgent(
             };
           }
 
-          // Replay thinking steps progress for implementation
+          // Replay thinking steps progress for implementation (fallback if not streamed)
           if (data.thinking && data.thinking.length) {
             for (const step of data.thinking) {
               if (signal.aborted) break;
