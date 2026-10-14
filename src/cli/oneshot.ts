@@ -379,6 +379,8 @@ export async function runOneShotAgent(
           }
         }
 
+        onProgress("thinking", "Contacting AI agent...", `Provider: ${target.provider}, Model: ${target.model || "default"}`);
+
         const response = await fetch(endpoint, {
           method: "POST",
           headers,
@@ -421,8 +423,10 @@ export async function runOneShotAgent(
         }
 
         if (!response.ok) {
+          const errText = await response.text();
+          console.error(`[Lasso] Gateway error ${response.status}:`, errText);
           const errData = (await response.json().catch(() => ({}))) as { error?: string };
-          const errorMessage = errData.error || `Agent request failed (${response.status})`;
+          const errorMessage = errData.error || `Agent request failed (${response.status}): ${errText}`;
           // Check for quota/plan exhaustion
           if (/quota exceeded|quota limit|out of quota|no quota|plan.*limit|plan.*exhausted|credit.*exhausted|billing.*quota|rate.*limit|429|too many requests|request.*limit|insufficient.*credits|no.*credits|credits.*exhausted|payment.*required|subscription.*required|upgrade.*required|upgrade.*plan|billing.*required/i.test(errorMessage)) {
             return { ok: false, error: "Your plan quota has been exhausted. Please upgrade your plan or add credits to continue using this service." };
@@ -439,6 +443,8 @@ export async function runOneShotAgent(
           changes?: SourceChange[];
           error?: string;
         };
+
+        console.log(`[Lasso] Gateway response:`, JSON.stringify({ status: data.status, hasChanges: !!data.changes, changesCount: data.changes?.length, hasReply: !!data.reply, hasError: !!data.error }));
 
         if (data.status === "failed" || data.error) {
           const error = data.error || data.summary || "Agent session failed on server.";

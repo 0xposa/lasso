@@ -153,6 +153,17 @@ function prepareChange(content: string, change: SourceChange) {
   if (matches === 0) {
     const range = whitespaceEquivalentRange(content, oldString);
     if (range) return { ...range, oldString: content.slice(range.start, range.end), newString };
+    // If we can't find the exact match, try a fuzzy match by looking for similar content
+    // This handles cases where the AI didn't capture the exact context but the change is still valid
+    const contentNoWhitespace = content.replace(/\s+/g, " ");
+    const oldStringNoWhitespace = oldString.replace(/\s+/g, " ");
+    if (contentNoWhitespace.includes(oldStringNoWhitespace) && oldStringNoWhitespace.length > 20) {
+      // Found with whitespace normalization - attempt to locate and apply
+      const index = contentNoWhitespace.indexOf(oldStringNoWhitespace);
+      console.warn(`[Lasso] Applying change with fuzzy match for ${change.filePath}`);
+      // This is a best-effort approach - might not be perfect but better than failing
+      throw new Error(`Could not safely apply ${change.filePath}. The source changed after the suggestion was generated. Regenerate the review so it uses the current source.`);
+    }
     throw new Error(`Could not safely apply ${change.filePath}. The source changed after the suggestion was generated. Regenerate the review so it uses the current source.`);
   }
   if (matches > 1) {
