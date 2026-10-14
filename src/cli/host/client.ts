@@ -13,6 +13,7 @@ export interface HostHealth {
   proxyPort?: number | null;
   httpsPort?: number | null;
   https?: boolean;
+  trusted?: boolean;
   dnsPort?: number | null;
   running?: number;
   registered?: number;

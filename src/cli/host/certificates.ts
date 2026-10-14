@@ -15,15 +15,21 @@ export function ensureHostCertificate(): { ok: boolean; trusted: boolean; error?
   fs.mkdirSync(HOST_DIR, { recursive: true, mode: 0o700 });
   if (hasCertificate()) return { ok: true, trusted: false };
 
+  // Try mkcert first - it creates system-trusted certificates
   try {
+    // Check if mkcert is available
+    execFileSync("mkcert", ["-version"], { stdio: "ignore" });
     execFileSync("mkcert", ["-install"], { stdio: "ignore" });
     execFileSync("mkcert", ["-cert-file", TLS_CERT_FILE, "-key-file", TLS_KEY_FILE, "localhost", "127.0.0.1", "::1", "*.lasso"], { stdio: "ignore" });
     fs.chmodSync(TLS_KEY_FILE, 0o600);
     return { ok: true, trusted: true };
-  } catch {
-    // mkcert is optional; OpenSSL still provides a usable local certificate.
+  } catch (mkcertError) {
+    console.warn("[Lasso] mkcert not available or failed, falling back to OpenSSL (certificate will show as not secure)");
+    console.warn("[Lasso] To fix this, install mkcert: https://mkcert.dev/");
+    console.warn("[Lasso] After installing, run: mkcert -install && rm -rf ~/.lasso/host && lasso daemon restart");
   }
 
+  // Fallback to OpenSSL - creates self-signed certificate (not trusted by browsers)
   const configFile = path.join(os.tmpdir(), `lasso-host-${process.pid}.cnf`);
   try {
     fs.writeFileSync(configFile, [
@@ -41,6 +47,17 @@ export function ensureHostCertificate(): { ok: boolean; trusted: boolean; error?
   }
 }
 
-export function hostCertificateStatus(): { present: boolean; certificate: string; key: string } {
-  return { present: hasCertificate(), certificate: TLS_CERT_FILE, key: TLS_KEY_FILE };
+export function hostCertificateStatus(): { present: boolean; certificate: string; key: string; trusted: boolean } {
+  // Check if certificate was created by mkcert (trusted) or OpenSSL (self-signed)
+  let trusted = false;
+  if (hasCertificate()) {
+    try {
+      const certContent = fs.readFileSync(TLS_CERT_FILE, "utf8");
+      // mkcert certificates include "mkcert" in the issuer
+      trusted = certContent.includes("mkcert");
+    } catch {
+      // If we can't read the cert, assume not trusted
+    }
+  }
+  return { present: hasCertificate(), certificate: TLS_CERT_FILE, key: TLS_KEY_FILE, trusted };
 }

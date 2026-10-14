@@ -150,7 +150,7 @@ const daemon = program.command("daemon [action]")
                 console.log(chalk.bold("Lasso Host"));
                 console.log(chalk.dim(`  Status: ${report.running ? chalk.green("running") + (report.pid ? ` (pid ${report.pid})` : "") : chalk.red("not running")}`));
                 console.log(chalk.dim(`  Proxy port: ${hostProxyPort(env)}`));
-                console.log(chalk.dim(`  HTTPS port: ${hostHttpsPort(env)}${report.health?.https ? chalk.green(" (certificate ready)") : chalk.yellow(" (certificate unavailable)")}`));
+                console.log(chalk.dim(`  HTTPS port: ${hostHttpsPort(env)}${report.health?.https ? (report.health.trusted ? chalk.green(" (trusted)") : chalk.yellow(" (self-signed)")) : chalk.yellow(" (certificate unavailable)")}`));
                 console.log(chalk.dim(`  DNS port: ${hostDnsPort(env)}`));
                 console.log(chalk.dim(`  Domain resolution: ${report.resolver.installed ? chalk.green("configured") : chalk.yellow("not configured")} — ${report.resolver.detail}`));
                 console.log(chalk.dim(`  Automatic startup: ${report.autoStart ? chalk.green("enabled (LaunchAgent)") : chalk.yellow("disabled")}`));

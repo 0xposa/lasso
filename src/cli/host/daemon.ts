@@ -257,6 +257,7 @@ export class LassoHost {
   }
 
   private health(res: http.ServerResponse): void {
+    const certStatus = hostCertificateStatus();
     writeJson(res, 200, {
       ok: true,
       service: SERVICE_NAME,
@@ -267,7 +268,8 @@ export class LassoHost {
       dnsPort: this.dnsHandle?.port ?? null,
       proxyPort: this.opts.proxyPort,
       httpsPort: this.opts.httpsPort,
-      https: hostCertificateStatus().present,
+      https: certStatus.present,
+      trusted: certStatus.trusted,
       running: this.running.size,
       registered: Object.keys(this.registry).length,
       projects: this.projectList(),
