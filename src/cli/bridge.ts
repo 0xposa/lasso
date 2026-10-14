@@ -1267,61 +1267,15 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         });
       } else if (msg.type === "apply") {
         try {
-          socket.send(JSON.stringify({
-            type: "agent_status",
-            taskId: msg.taskId,
-            status: "working",
-            message: "Re-generating changes with current file state..."
-          }));
-
-          // Re-run the edit request to get fresh changes based on current file state
-          const editRequest = editRequests.get(msg.taskId);
-          const editConfig = editConfigs.get(msg.taskId);
-
-          if (!editRequest || !editConfig) {
-            socket.send(JSON.stringify({
-              type: "agent_status",
-              taskId: msg.taskId,
-              status: "error",
-              message: "Could not re-generate changes: original request not found."
-            }));
-            return;
-          }
-
-          const controller = new AbortController();
-          taskControllers.set(msg.taskId, controller);
-
-          const freshProposal = await proposeChanges(
-            cwd,
-            editRequest,
-            editConfig,
-            controller.signal,
-            (message, detail, level) => {
-              if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
-                socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: level === "error" ? "error" : "working", message, detail }));
-              }
-            },
-            (prompt) => {
-              if (!controller.signal.aborted && socket.readyState === socket.OPEN) {
-                socket.send(JSON.stringify({ type: "agent_prompt", taskId: msg.taskId, prompt }));
-              }
-            }
-          );
-
-          if (controller.signal.aborted) {
-            socket.send(JSON.stringify({ type: "agent_status", taskId: msg.taskId, status: "stopped", message: "Agent stopped." }));
-            return;
-          }
-
-          // Apply the fresh changes
-          const filePaths = [...new Set(freshProposal.changes.map(c => c.filePath))];
+          // Create snapshot before applying changes
+          const filePaths = [...new Set(msg.changes.map(c => c.filePath))];
           const parentSnapshot = getSnapshotByTaskId(cwd, msg.taskId);
 
           // Create pre-apply snapshot
           const preSnapshot = createSnapshot(
             cwd,
             msg.taskId,
-            `Pre-apply: ${freshProposal.changes.length} file${freshProposal.changes.length === 1 ? "" : "s"}`,
+            `Pre-apply: ${msg.changes.length} file${msg.changes.length === 1 ? "" : "s"}`,
             filePaths,
             parentSnapshot?.id
           );
@@ -1329,7 +1283,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
           const snapshots: Array<{ filePath: string; content: string | null }> = [];
           const planned = new Map<string, { filePath: string; content: string; exists: boolean; start: number; end: number; oldString: string; newString: string }[]>();
 
-          for (const change of freshProposal.changes) {
+          for (const change of msg.changes) {
             const isNew = !change.oldString;
             const filePath = resolveProposedFile(cwd, change.filePath, true);
             const exists = fs.existsSync(filePath);
@@ -1364,7 +1318,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
           createSnapshot(
             cwd,
             msg.taskId,
-            `Applied: ${freshProposal.changes.length} file${freshProposal.changes.length === 1 ? "" : "s"}`,
+            `Applied: ${msg.changes.length} file${msg.changes.length === 1 ? "" : "s"}`,
             filePaths,
             preSnapshot.id
           );
@@ -1387,19 +1341,19 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
             buildErrorContext.set(msg.taskId, {
               errors: validation.errors,
               command: validation.command,
-              originalChanges: freshProposal.changes,
+              originalChanges: msg.changes,
               retryCount: 0
             });
 
             // Trigger automatic build fix
-            await triggerBuildFix(cwd, msg.taskId, validation.errors, validation.command, freshProposal.changes, resolvedLassoKey, agentConfig, collabConfig, socket, taskControllers, taskSnapshots, buildErrorContext);
+            await triggerBuildFix(cwd, msg.taskId, validation.errors, validation.command, msg.changes, resolvedLassoKey, agentConfig, collabConfig, socket, taskControllers, taskSnapshots, buildErrorContext);
             return;
           }
 
           socket.send(JSON.stringify({
             type: "applied",
             taskId: msg.taskId,
-            message: `${freshProposal.changes.length} file${freshProposal.changes.length === 1 ? "" : "s"} updated. Your dev server will reload.`,
+            message: `${msg.changes.length} file${msg.changes.length === 1 ? "" : "s"} updated. Your dev server will reload.`,
             validation
           }));
         } catch (error) {
