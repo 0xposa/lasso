@@ -63,10 +63,10 @@ export class LassoHost {
   private readonly proxies = new Map<number, httpProxy>();
 
   constructor(private readonly opts: HostRuntimeOptions) {
-    this.server = http.createServer((req, res) => this.handleRequest(req, res));
-    this.server.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
-    this.secureServer = https.createServer({}, (req, res) => this.handleRequest(req, res));
-    this.secureServer.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head));
+    this.server = http.createServer((req, res) => this.handleRequest(req, res, false));
+    this.server.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head, false));
+    this.secureServer = https.createServer({}, (req, res) => this.handleRequest(req, res, true));
+    this.secureServer.on("upgrade", (req, socket, head) => this.handleUpgrade(req, socket, head, true));
     this.resolver = createDomainResolver();
     this.registry = loadRegistry();
     for (const domain of Object.keys(this.registry)) this.cleanupOnStart.add(domain);
@@ -278,7 +278,7 @@ export class LassoHost {
 
   // ---- request handling --------------------------------------------
 
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse, isSecure: boolean = false): void {
     const url = req.url || "/";
 
     const route = this.routes().find((r) => r.route === `${req.method} ${url}`);
@@ -299,6 +299,14 @@ export class LassoHost {
     const hostname = domainOf(req.headers.host || "");
     if (!isLassoDomain(hostname)) {
       writeJson(res, 404, { ok: false, error: "Lasso Host only proxies *.lasso domains.", host: req.headers.host });
+      return;
+    }
+
+    // Redirect HTTP to HTTPS for .lasso domains
+    if (!isSecure) {
+      const httpsUrl = `https://${hostname}${url}`;
+      res.writeHead(301, { Location: httpsUrl });
+      res.end();
       return;
     }
 
@@ -328,13 +336,22 @@ export class LassoHost {
     });
   }
 
-  private handleUpgrade(req: http.IncomingMessage, socket: import("node:stream").Duplex, head: Buffer): void {
+  private handleUpgrade(req: http.IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, isSecure: boolean): void {
     const hostname = domainOf(req.headers.host || "");
     if (!isLassoDomain(hostname)) {
       socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
+
+    // Redirect HTTP WebSocket upgrades to HTTPS
+    if (!isSecure) {
+      const wsUrl = `wss://${hostname}${req.url}`;
+      socket.write(`HTTP/1.1 301 Moved Permanently\r\nLocation: ${wsUrl}\r\nConnection: close\r\n\r\n`);
+      socket.destroy();
+      return;
+    }
+
     void (async () => {
       let runtime: ProjectRuntime;
       try {
@@ -364,7 +381,7 @@ export class LassoHost {
       this.log(`dns server failed to start on ${this.opts.dnsPort}: ${line(error)}`);
     }
 
-    const certificate = ensureHostCertificate();
+    const certificate = await ensureHostCertificate((message) => this.log(message));
     if (!certificate.ok) this.log(`https certificate unavailable: ${certificate.error}`);
     else {
       this.secureServer.setSecureContext({ key: fs.readFileSync(TLS_KEY_FILE), cert: fs.readFileSync(TLS_CERT_FILE) });
