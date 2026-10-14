@@ -272,11 +272,12 @@ export function hostCertificateStatus(): { present: boolean; certificate: string
   let trusted = false;
   if (hasCertificate()) {
     try {
-      const certContent = fs.readFileSync(TLS_CERT_FILE, "utf8").toLowerCase();
-      // mkcert certificates include "mkcert" in the issuer or subject (case-insensitive)
-      trusted = certContent.includes("mkcert");
+      // Use openssl to check the issuer of the certificate
+      const result = execFileSync("openssl", ["x509", "-noout", "-issuer", "-in", TLS_CERT_FILE], { encoding: "utf8" });
+      // mkcert certificates have "mkcert" in the issuer
+      trusted = result.toLowerCase().includes("mkcert");
     } catch {
-      // If we can't read the cert, assume not trusted
+      // If openssl fails, assume not trusted
     }
   }
   return { present: hasCertificate(), certificate: TLS_CERT_FILE, key: TLS_KEY_FILE, trusted };
