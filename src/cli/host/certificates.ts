@@ -201,9 +201,20 @@ async function installMkcert(): Promise<{ ok: boolean; error?: string }> {
 
 export async function ensureHostCertificate(onProgress?: (message: string) => void): Promise<{ ok: boolean; trusted: boolean; error?: string }> {
   fs.mkdirSync(HOST_DIR, { recursive: true, mode: 0o700 });
+  
+  // Check if certificate exists and is trusted
   if (hasCertificate()) {
     const certStatus = hostCertificateStatus();
-    return { ok: true, trusted: certStatus.trusted };
+    // If certificate exists but is not trusted and mkcert is available, regenerate it
+    if (!certStatus.trusted && isMkcertInstalled()) {
+      onProgress?.("Regenerating certificate with mkcert for trusted SSL...");
+      try {
+        fs.unlinkSync(TLS_CERT_FILE);
+        fs.unlinkSync(TLS_KEY_FILE);
+      } catch {}
+    } else {
+      return { ok: true, trusted: certStatus.trusted };
+    }
   }
 
   onProgress?.("Generating SSL certificate...");
