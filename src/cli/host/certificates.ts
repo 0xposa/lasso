@@ -205,6 +205,7 @@ export async function ensureHostCertificate(onProgress?: (message: string) => vo
   // Check if certificate exists and is trusted
   if (hasCertificate()) {
     const certStatus = hostCertificateStatus();
+    console.log(`[Lasso] Certificate exists, trusted: ${certStatus.trusted}`);
     // If certificate exists but is not trusted and mkcert is available, regenerate it
     if (!certStatus.trusted && isMkcertInstalled()) {
       onProgress?.("Regenerating certificate with mkcert for trusted SSL...");
@@ -222,23 +223,27 @@ export async function ensureHostCertificate(onProgress?: (message: string) => vo
   // Try mkcert first - it creates system-trusted certificates
   if (!isMkcertInstalled()) {
     onProgress?.("mkcert not found, installing...");
+    console.log("[Lasso] mkcert not found, attempting installation...");
     const installResult = await installMkcert();
     if (!installResult.ok) {
       console.warn(`[Lasso] ${installResult.error}`);
       console.warn("[Lasso] Falling back to OpenSSL (certificate will show as not secure)");
     }
+  } else {
+    console.log("[Lasso] mkcert is installed");
   }
 
   if (isMkcertInstalled()) {
     try {
       onProgress?.("Creating trusted certificate with mkcert...");
       const mkcertPath = getMkcertPath();
+      console.log(`[Lasso] Using mkcert at: ${mkcertPath}`);
       execFileSync(mkcertPath, ["-cert-file", TLS_CERT_FILE, "-key-file", TLS_KEY_FILE, "localhost", "127.0.0.1", "::1", "*.lasso"], { stdio: "ignore" });
       fs.chmodSync(TLS_KEY_FILE, 0o600);
       onProgress?.("✓ SSL certificate ready (trusted)");
       return { ok: true, trusted: true };
     } catch (mkcertError) {
-      console.warn("[Lasso] mkcert failed, falling back to OpenSSL");
+      console.warn("[Lasso] mkcert failed, falling back to OpenSSL:", mkcertError);
     }
   }
 
@@ -268,8 +273,11 @@ export function hostCertificateStatus(): { present: boolean; certificate: string
   if (hasCertificate()) {
     try {
       const certContent = fs.readFileSync(TLS_CERT_FILE, "utf8");
-      // mkcert certificates include "mkcert" in the issuer
-      trusted = certContent.includes("mkcert");
+      // mkcert certificates include "mkcert" in the issuer or subject
+      // Also check for common mkcert issuer patterns
+      trusted = certContent.includes("mkcert") || 
+                certContent.includes("mkcert development CA") ||
+                certContent.includes("Filippo Valsorda");
     } catch {
       // If we can't read the cert, assume not trusted
     }
