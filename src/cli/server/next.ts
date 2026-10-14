@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import http from "node:http";
 import httpProxy from "http-proxy";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -10,10 +10,27 @@ const PUBLIC_PORT = 3000; // what the user opens in the browser
 const INTERNAL_PORT = 3055; // where the real `next dev` actually runs
 
 function serveOverlayBundle(res: ServerResponse, cwd: string) {
-    const bundlePath = resolve(cwd, "node_modules/lasso/dist/overlay.js");
-    // when running from within the Lasso repo itself (not yet published),
-    // this resolves relative to Lasso's own dist folder instead — adjust
-    // the path to point at your actual dist/overlay.js location for now.
+    // Try multiple possible paths for the overlay bundle
+    const possiblePaths = [
+        resolve(cwd, "node_modules/@lasso-ai/cli/dist/overlay.js"),
+        resolve(cwd, "node_modules/lasso/dist/overlay.js"),
+        resolve(__dirname, "../../overlay.js"), // When running from Lasso repo
+    ];
+    
+    let bundlePath: string | undefined;
+    for (const path of possiblePaths) {
+        if (existsSync(path)) {
+            bundlePath = path;
+            break;
+        }
+    }
+    
+    if (!bundlePath) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Lasso overlay bundle not found. Make sure @lasso-ai/cli is installed.");
+        return;
+    }
+    
     res.setHeader("Content-Type", "application/javascript");
     res.end(readFileSync(bundlePath, "utf-8"));
 }
