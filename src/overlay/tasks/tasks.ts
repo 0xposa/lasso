@@ -1,5 +1,5 @@
 import { getDOM } from "../dom";
-import { state, saveChatHistory } from "../state";
+import { state, saveChatHistory, saveAgentTasks } from "../state";
 import { bridge } from "../bridge/bridge";
 import type { AgentTask, AgentTaskStatus, ChatMessage, PendingChange } from "../types";
 
@@ -97,6 +97,7 @@ export function createAgentTask(
   };
   state.agentTasks.unshift(task);
   state.activeTaskId = task.id;
+  saveAgentTasks(state.agentTasks);
   renderTasks();
   return task;
 }
@@ -105,11 +106,19 @@ export function getAgentTask(id: string | null | undefined): AgentTask | undefin
   return id ? state.agentTasks.find((task) => task.id === id) : undefined;
 }
 
+export function deleteAgentTask(id: string): void {
+  state.agentTasks = state.agentTasks.filter((task) => task.id !== id);
+  if (state.activeTaskId === id) state.activeTaskId = null;
+  saveAgentTasks(state.agentTasks);
+  renderTasks();
+}
+
 export function updateAgentTask(id: string | undefined, patch: Partial<AgentTask>): void {
   if (!id) return;
   const task = getAgentTask(id);
   if (!task) return;
   Object.assign(task, patch, { updatedAt: new Date().toISOString() });
+  saveAgentTasks(state.agentTasks);
   renderTasks();
 }
 
@@ -172,6 +181,14 @@ export function stopAgentTask(id: string): void {
   if (!task) return;
   bridge.send({ type: "stop", taskId: id });
   updateAgentTask(id, { status: "stopped", message: "Task stopped." });
+}
+
+export function clearAgentTasks(): void {
+  state.agentTasks = [];
+  state.activeTaskId = null;
+  state.promptTaskId = null;
+  saveAgentTasks(state.agentTasks);
+  renderTasks();
 }
 
 export function toggleTaskPanel(force?: boolean): void {

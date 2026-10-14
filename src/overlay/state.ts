@@ -105,6 +105,25 @@ export function clearChatHistory(): void {
   }
 }
 
+const agentTasksKey = "lasso:agentTasks";
+
+export function loadAgentTasks(): AgentTask[] {
+  try {
+    const raw = localStorage.getItem(agentTasksKey);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveAgentTasks(tasks: AgentTask[]): void {
+  try {
+    localStorage.setItem(agentTasksKey, JSON.stringify(tasks));
+  } catch {
+    // Storage may be disabled or quota exceeded
+  }
+}
+
 export class OverlayState {
   // Mode & Selection
   selectMode = false;
@@ -191,6 +210,8 @@ export class OverlayState {
       const found = this.MODELS.find((m) => m.id === saved);
       if (found) this.selectedModel = found;
     }
+    // Load agent tasks from localStorage
+    this.agentTasks = loadAgentTasks();
   }
 }
 
