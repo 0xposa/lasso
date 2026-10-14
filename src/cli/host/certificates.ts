@@ -33,7 +33,8 @@ async function installMkcert(): Promise<{ ok: boolean; error?: string }> {
         installCommand = "brew";
         installArgs = ["install", "mkcert", "nss"];
       } catch {
-        return resolve({ ok: false, error: "Homebrew not found. Please install Homebrew first: https://brew.sh/" });
+        // Homebrew not available or not working (e.g., Intel Mac unsupported)
+        return resolve({ ok: false, error: "Homebrew not available or unsupported. Please install mkcert manually: https://mkcert.dev/\nThen run: mkcert -install && rm -rf ~/.lasso/host && lasso daemon restart" });
       }
     } else if (platform === "linux") {
       // Linux: Try different package managers
