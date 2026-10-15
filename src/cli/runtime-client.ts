@@ -148,7 +148,13 @@ export interface SessionVerificationResult {
  */
 export interface RuntimeFacade {
   createSession(input: RuntimeSessionInput): Promise<RuntimeSession>;
-  runSession(sessionId: string, projectPath: string, onEvent: RuntimeEventHandler, signal?: AbortSignal): Promise<void>;
+  runSession(
+    sessionId: string,
+    projectPath: string,
+    onEvent: RuntimeEventHandler,
+    signal?: AbortSignal,
+    opts?: { providerApiKey?: string }
+  ): Promise<void>;
   getSession(sessionId: string): Promise<RuntimeSession>;
   verifySession(sessionId: string, projectPath: string): Promise<SessionVerificationResult>;
   switchModel(
@@ -261,7 +267,8 @@ export class RuntimeClient {
     sessionId: string,
     projectPath: string,
     onEvent: RuntimeEventHandler,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    opts?: { providerApiKey?: string }
   ): Promise<void> {
     // CLI-side snapshot: nothing the agent does is left on disk before review.
     let guard: WorkspaceGuard | null = null;
@@ -311,7 +318,9 @@ export class RuntimeClient {
         "Content-Type": "application/json",
         ...(this.apiKey && { "Authorization": `Bearer ${this.apiKey}` }),
       },
-      body: JSON.stringify({ projectPath }),
+      // providerApiKey is the user's own model-provider key (BYOK): the
+      // server calls the hosted model with it and never stores it.
+      body: JSON.stringify({ projectPath, apiKey: opts?.providerApiKey }),
       signal,
     });
 

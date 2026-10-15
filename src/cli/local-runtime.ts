@@ -105,7 +105,8 @@ export class LocalRuntime implements RuntimeFacade {
     sessionId: string,
     projectPath: string,
     onEvent: RuntimeEventHandler,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    _opts?: { providerApiKey?: string } // local agents run in-process; no server/model key needed
   ): Promise<void> {
     const record = this.sessions.get(sessionId);
     if (!record) throw new Error("Session not found");

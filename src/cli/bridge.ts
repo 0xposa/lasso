@@ -189,6 +189,22 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     ...readEnvFile(root, ".env.production"),
   }), {});
 
+  // Resolve the user's own model-provider key (BYOK) for hosted runs: the
+  // server calls the provider with it and never stores it.
+  const PROVIDER_ENV_KEYS: Record<string, string[]> = {
+    anthropic: ["ANTHROPIC_API_KEY"],
+    openai: ["OPENAI_API_KEY"],
+    google: ["GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY"],
+    nvidia: ["NVIDIA_API_KEY"],
+  };
+  function providerApiKeyFor(provider: string): string | undefined {
+    for (const envName of PROVIDER_ENV_KEYS[provider] || []) {
+      const value = (process.env[envName] || fileEnv[envName] || "").trim();
+      if (value) return value;
+    }
+    return undefined;
+  }
+
   const cliCredentials = loadCredentials();
   const resolvedLassoKey = cliCredentials?.apiKey ||
     resolveLassoApiKey(fileEnv) ||
@@ -506,7 +522,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
         handleRuntimeEvent(event, socket, taskId, session, `Runtime session: ${instruction}`, true);
-      }, controller.signal);
+      }, controller.signal, { providerApiKey: providerApiKeyFor(provider) });
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
@@ -658,7 +674,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     try {
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
         handleRuntimeEvent(event, socket, taskId, session, "Corrective run", true);
-      }, controller.signal);
+      }, controller.signal, { providerApiKey: providerApiKeyFor(session.model?.provider || "") });
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
@@ -827,7 +843,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
             message: "Oneshot completed",
           } satisfies ServerBridgeMessage));
         }
-      }, controller.signal);
+      }, controller.signal, { providerApiKey: providerApiKeyFor(provider) });
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
