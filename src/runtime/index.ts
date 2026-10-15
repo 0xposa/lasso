@@ -12,6 +12,8 @@ export * from "./agent-state-machine";
 export * from "./event-mapper";
 export * from "./review";
 export * from "./local-session-runner";
+export * from "./tool-protocol";
+export { ActionExecutor, ActionExecutionResult } from "./action-executor";
 export * from "./adapters/factory";
 export { LocalAgentAdapter, EventSink, newRunState } from "./adapters/local-agent-adapter";
 export type { LocalAgentConfig, CommandSpec, AgentRunState } from "./adapters/local-agent-adapter";

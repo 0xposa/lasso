@@ -391,6 +391,7 @@ export type AgentEventType =
   | "phase_changed"
   | "tool_started"
   | "tool_completed"
+  | "tool_call"
   | "observation"
   | "plan_created"
   | "file_changed"
@@ -440,12 +441,28 @@ export interface ToolStartedEvent extends AgentEvent {
 
 export interface ToolCompletedEvent extends AgentEvent {
   type: "tool_completed";
-  
+
   data: {
     actionType: string;
     target?: string;
     success: boolean;
     duration?: number;
+  };
+}
+
+/**
+ * Emitted by the server when the hosted model requests a workspace tool.
+ * The local CLI executes the tool and posts the result back to
+ * `POST /sessions/:sessionId/tool-results` (see tool-protocol.ts).
+ */
+export interface ToolCallEvent extends AgentEvent {
+  type: "tool_call";
+
+  data: {
+    callId: string;
+    kind: "action" | "verify";
+    action?: AgentAction;
+    verify?: { phase?: string };
   };
 }
 
