@@ -1140,6 +1140,16 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
             }
             break;
 
+          case "runtime_error":
+            // Overlay-side crash (e.g. ReferenceError) — surface it in the
+            // daemon log so it's diagnosable.
+            console.error(
+              "[overlay error]",
+              (msg as any).selectionId || "",
+              (msg as any).details || (msg as any).message || msg
+            );
+            break;
+
           default:
             console.warn("Unknown bridge message type:", (msg as any).type);
         }

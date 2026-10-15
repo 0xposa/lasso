@@ -996,6 +996,8 @@ async function runPrompt(prompt: string, skipUserMessage = false): Promise<void>
   activeTaskId = taskId;
   activeStartTime = Date.now();
 
+  const isChat = isConversationalPrompt(prompt);
+
   // Append initial assistant message with thinking widget. The first step is
   // the request itself — real model/action steps replace it as they arrive.
   const initialStepTitle = prompt.length > 90 ? `${prompt.slice(0, 90)}…` : prompt;
