@@ -480,8 +480,28 @@ export async function fetchModels(fileEnv: Record<string, string>): Promise<Mode
     const serverUrl = serverUrlFrom(fileEnv).replace(/\/$/, "");
     const apiUrl = `${serverUrl}/api/v1`;
 
+    // Pass the user's own provider keys (BYOK) so the server can list live
+    // models per provider instead of falling back to empty/static lists.
+    const envKey = (...names: string[]): string => {
+        for (const name of names) {
+            const value = (process.env[name] || fileEnv[name] || "").trim();
+            if (value) return value;
+        }
+        return "";
+    };
+    const query = new URLSearchParams();
+    const anthropicKey = envKey("ANTHROPIC_API_KEY");
+    const openaiKey = envKey("OPENAI_API_KEY");
+    const googleKey = envKey("GOOGLE_GENERATIVE_AI_API_KEY", "GOOGLE_API_KEY");
+    const nvidiaKey = envKey("NVIDIA_API_KEY");
+    if (anthropicKey) query.set("anthropicKey", anthropicKey);
+    if (openaiKey) query.set("openaiKey", openaiKey);
+    if (googleKey) query.set("googleKey", googleKey);
+    if (nvidiaKey) query.set("nvidiaKey", nvidiaKey);
+    const qs = query.toString();
+
     try {
-        const response = await fetchWithTimeout(`${apiUrl}/models`, {
+        const response = await fetchWithTimeout(`${apiUrl}/models${qs ? `?${qs}` : ""}`, {
             method: "GET",
         });
 
