@@ -43,6 +43,13 @@ export class AgentStateMachine {
   };
 
   /**
+   * Action types allowed in a phase (public, e.g. for model prompts).
+   */
+  static allowedActions(phase: AgentPhase): string[] {
+    return [...(this.ALLOWED_ACTIONS[phase] || [])];
+  }
+
+  /**
    * Check if a phase transition is valid
    */
   static canTransition(session: LassoAgentSession, toPhase: AgentPhase): boolean {
@@ -227,7 +234,9 @@ export class AgentStateMachine {
     return (
       session.phase === "execute" &&
       session.completedActions.length > 0 &&
-      session.errors.filter((e) => e.phase === "execute").length === 0
+      // Validation feedback (model proposed a rejected action) is teaching
+      // material for the next prompt — it must not block verification.
+      session.errors.filter((e) => e.phase === "execute" && e.type !== "validation").length === 0
     );
   }
 

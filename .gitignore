@@ -78,3 +78,8 @@ core-*
 *.map
 npm-debug.*
 yarn-debug.*
+
+bun.lock
+pnpm-lock.yaml
+package-lock.json
+yarn.lock

@@ -175,27 +175,36 @@ export async function runOneShotAgent(
 
       switch (event.type) {
         case "agent_started":
-          onProgress("thinking", "Agent started", "Initializing runtime");
           break;
 
-        case "agent_reasoning":
-          const summary = (event.data as any).summary || "Thinking...";
-          thinkingSteps.push({ title: summary, durationMs: 0 });
-          onProgress("thinking", summary);
+        case "agent_reasoning": {
+          const summary = (event.data as any)?.summary;
+          if (summary) {
+            thinkingSteps.push({ title: summary, durationMs: 0 });
+            onProgress("thinking", summary);
+          }
           break;
+        }
 
-        case "tool_started":
-          const tool = (event.data as any).tool || "tool";
-          onProgress("working", `Running ${tool}...`);
+        case "tool_started": {
+          const data = (event.data as any) || {};
+          if (data.actionType === "model") break;
+          const message = data.label || data.tool;
+          if (message) onProgress("working", message);
           break;
+        }
 
-        case "tool_completed":
-          onProgress("working", "Tool completed");
+        case "tool_completed": {
+          const data = (event.data as any) || {};
+          if (data.actionType === "model") break;
+          if (data.success === false) {
+            const message = data.label || data.tool;
+            onProgress("working", message ? `${message} didn't finish` : "A step didn't finish");
+          }
           break;
+        }
 
         case "phase_changed":
-          const phase = (event.data as any).phase;
-          onProgress("working", `Phase: ${phase}`);
           break;
 
         case "verification_started":

@@ -170,8 +170,8 @@ export type RuntimeEvent =
   | { type: "agent_started"; sessionId: string; data: {}; timestamp: number }
   | { type: "agent_reasoning"; sessionId: string; data: { summary: string }; timestamp: number }
   | { type: "phase_changed"; sessionId: string; data: { from: string; to: string }; timestamp: number }
-  | { type: "tool_started"; sessionId: string; data: { actionType: string }; timestamp: number }
-  | { type: "tool_completed"; sessionId: string; data: { actionType: string; success: boolean }; timestamp: number }
+  | { type: "tool_started"; sessionId: string; data: { actionType: string; label?: string }; timestamp: number }
+  | { type: "tool_completed"; sessionId: string; data: { actionType: string; label?: string; success: boolean; error?: string }; timestamp: number }
   | { type: "tool_call"; sessionId: string; data: ToolCallRequest; timestamp: number }
   | { type: "observation"; sessionId: string; data: { observationType: string; summary: string }; timestamp: number }
   | { type: "verification_started"; sessionId: string; data: { verificationType: string }; timestamp: number }

@@ -321,43 +321,64 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
     switch (event.type) {
       case "agent_started":
-      case "agent_reasoning":
-        socket.send(JSON.stringify({
-          type: "agent_status",
-          taskId,
-          status: "thinking",
-          message: (event.data as any).summary || "Working...",
-        } satisfies ServerBridgeMessage));
+        // No canned step — the command bar's initial step (the user's own
+        // request) is already running; the next real event replaces it.
         break;
 
-      case "tool_started":
-        socket.send(JSON.stringify({
-          type: "agent_status",
-          taskId,
-          status: "working",
-          message: `Running ${(event.data as any).tool || (event.data as any).actionType || "tool"}...`,
-        } satisfies ServerBridgeMessage));
-        break;
-
-      case "tool_completed":
-        socket.send(JSON.stringify({
-          type: "agent_status",
-          taskId,
-          status: "working",
-          message: "Completed tool",
-        } satisfies ServerBridgeMessage));
-        break;
-
-      case "phase_changed": {
-        const phase = (event.data as any).phase;
-        socket.send(JSON.stringify({
-          type: "agent_status",
-          taskId,
-          status: "working",
-          message: `Phase: ${phase}`,
-        } satisfies ServerBridgeMessage));
+      case "agent_reasoning": {
+        // The model's actual reasoning summary — dynamic content only.
+        const summary = (event.data as any)?.summary;
+        if (summary) {
+          socket.send(JSON.stringify({
+            type: "agent_status",
+            taskId,
+            status: "thinking",
+            message: summary,
+          } satisfies ServerBridgeMessage));
+        }
         break;
       }
+
+      case "tool_started": {
+        const data = (event.data as any) || {};
+        // Model invocations are internal — the reasoning summaries bracket
+        // them; never surface "Running model" style steps.
+        if (data.actionType === "model") break;
+        const message = data.label || data.tool;
+        if (message) {
+          socket.send(JSON.stringify({
+            type: "agent_status",
+            taskId,
+            status: "working",
+            message,
+            detail: data.detail,
+          } satisfies ServerBridgeMessage));
+        }
+        break;
+      }
+
+      case "tool_completed": {
+        const data = (event.data as any) || {};
+        if (data.actionType === "model") break;
+        // Success: the step auto-completes when the next event arrives.
+        // Only failures surface, with the real error.
+        if (data.success === false) {
+          const message = data.label || data.tool;
+          socket.send(JSON.stringify({
+            type: "agent_status",
+            taskId,
+            status: "working",
+            message: message ? `${message} didn't finish` : "A step didn't finish",
+            detail: data.error || data.detail,
+          } satisfies ServerBridgeMessage));
+        }
+        break;
+      }
+
+      case "phase_changed":
+        // Internal phase names ("execute", "verify") are jargon — the
+        // reasoning and action labels already tell the real story.
+        break;
 
       case "verification_started":
         socket.send(JSON.stringify({
@@ -467,11 +488,12 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     const controller = new AbortController();
     taskControllers.set(taskId, controller);
 
+    // First step = the user's own instruction (dynamic), not canned copy.
     socket.send(JSON.stringify({
       type: "agent_status",
       taskId,
       status: "thinking",
-      message: "Starting...",
+      message: instruction.length > 90 ? `${instruction.slice(0, 90)}…` : instruction,
     } satisfies ServerBridgeMessage));
 
     try {
@@ -795,12 +817,8 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     const controller = new AbortController();
     taskControllers.set(taskId, controller);
 
-    socket.send(JSON.stringify({
-      type: "agent_status",
-      taskId,
-      status: "thinking",
-      message: "Starting oneshot...",
-    } satisfies ServerBridgeMessage));
+    // No canned "Starting oneshot..." step: the command bar shows the
+    // user's own request as the initial step; real events take it from there.
 
     try {
       const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
