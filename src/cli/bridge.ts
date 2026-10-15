@@ -391,21 +391,30 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         break;
 
       case "verification_started":
-        socket.send(JSON.stringify({
-          type: "agent_status",
-          taskId,
-          status: "review",
-          message: "Verifying changes...",
-        } satisfies ServerBridgeMessage));
+        // No canned status line — the check names/results arrive with
+        // verification_completed and become the real progress copy.
         break;
 
       case "verification_completed": {
-        const passed = (event.data as any).success ?? (event.data as any).passed;
+        const data = (event.data as any) || {};
+        const passed = data.success ?? data.passed;
+        const summaries: string[] = (data.observations || [])
+          .map((o: any) => o?.summary)
+          .filter(Boolean);
+        const errList: string[] = (data.errors || [])
+          .map((e: any) => e?.message)
+          .filter(Boolean);
+        const message = summaries.length
+          ? summaries.join(" · ")
+          : passed
+            ? "Checks passed"
+            : "Checks failed";
         socket.send(JSON.stringify({
           type: "agent_status",
           taskId,
           status: passed ? "working" : "error",
-          message: passed ? "Verification passed" : "Verification failed",
+          message,
+          ...(errList.length ? { detail: errList.join("\n") } : {}),
         } satisfies ServerBridgeMessage));
         break;
       }

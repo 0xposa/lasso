@@ -208,13 +208,25 @@ export async function runOneShotAgent(
           break;
 
         case "verification_started":
-          onProgress("review", "Verifying changes...");
+          // Real check names/results arrive with verification_completed.
           break;
 
-        case "verification_completed":
-          const passed = (event.data as any).success ?? (event.data as any).passed;
-          onProgress(passed ? "working" : "error", passed ? "Verification passed" : "Verification failed");
+        case "verification_completed": {
+          const data = (event.data as any) || {};
+          const passed = data.success ?? data.passed;
+          const summaries: string[] = (data.observations || [])
+            .map((o: any) => o?.summary)
+            .filter(Boolean);
+          onProgress(
+            passed ? "working" : "error",
+            summaries.length
+              ? summaries.join(" · ")
+              : passed
+                ? "Checks passed"
+                : "Checks failed"
+          );
           break;
+        }
 
         case "waiting_for_user":
           const question = (event as any).data?.question || "Input required";
