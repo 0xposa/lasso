@@ -327,13 +327,23 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
       case "agent_reasoning": {
         // The model's actual reasoning summary — dynamic content only.
+        // Raw thoughts (when the provider exposes them) ride along as the
+        // step's detail line.
         const summary = (event.data as any)?.summary;
         if (summary) {
+          const raw = (event.data as any)?.raw;
+          const detail =
+            typeof raw === "string" && raw.trim()
+              ? raw.length > 800
+                ? `${raw.slice(0, 800)}…`
+                : raw
+              : undefined;
           socket.send(JSON.stringify({
             type: "agent_status",
             taskId,
             status: "thinking",
             message: summary,
+            detail,
           } satisfies ServerBridgeMessage));
         }
         break;

@@ -366,6 +366,8 @@ export interface LassoModelResponse {
   
   reasoning: {
     summary: string;
+    /** Raw model thoughts / extended reasoning, when the provider exposes it. */
+    raw?: string;
   };
   
   decision: {
@@ -417,6 +419,8 @@ export interface AgentReasoningEvent extends AgentEvent {
   data: {
     summary: string;
     decision?: string;
+    /** Raw model thoughts for UI detail display. */
+    raw?: string;
   };
 }
 

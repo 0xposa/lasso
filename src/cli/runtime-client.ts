@@ -168,7 +168,7 @@ export interface RuntimeFacade {
 
 export type RuntimeEvent =
   | { type: "agent_started"; sessionId: string; data: {}; timestamp: number }
-  | { type: "agent_reasoning"; sessionId: string; data: { summary: string }; timestamp: number }
+  | { type: "agent_reasoning"; sessionId: string; data: { summary: string; raw?: string }; timestamp: number }
   | { type: "phase_changed"; sessionId: string; data: { from: string; to: string }; timestamp: number }
   | { type: "tool_started"; sessionId: string; data: { actionType: string; label?: string }; timestamp: number }
   | { type: "tool_completed"; sessionId: string; data: { actionType: string; label?: string; success: boolean; error?: string }; timestamp: number }
