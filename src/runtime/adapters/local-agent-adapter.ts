@@ -409,6 +409,16 @@ export abstract class LocalAgentAdapter implements IBackend {
 
   /** Build the shared task prompt (project context + continuation context). */
   protected buildTaskPrompt(context: TaskContext): string {
+    if (context.mode === "conversation") {
+      return [
+        "Answer the user's message conversationally.",
+        "Do not inspect the project, read files, run shell commands, use tools, edit files, or start a coding task.",
+        "Return one concise, natural-language answer only.",
+        "",
+        `User message: ${context.userPrompt}`,
+      ].join("\n");
+    }
+
     const lines: string[] = [];
     lines.push("You are working inside a Lasso-managed review workflow.");
     lines.push("Complete the following task by editing this project directly:");

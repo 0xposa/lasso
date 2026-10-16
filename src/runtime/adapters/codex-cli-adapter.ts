@@ -33,7 +33,7 @@ interface CodexItem {
   exit_code?: number;
   status?: string;
   changes?: Array<{ path?: string; kind?: string }>;
-  error?: { message?: string };
+  error?: unknown;
   message?: string;
 }
 
@@ -41,7 +41,7 @@ interface CodexEvent {
   type?: string;
   thread_id?: string;
   message?: string;
-  error?: { message?: string };
+  error?: unknown;
   item?: CodexItem;
   usage?: unknown;
 }
@@ -106,11 +106,15 @@ export class CodexCLIAdapter extends LocalAgentAdapter {
     const args: string[] = ["exec"];
     if (resumeId) {
       // `resume` does not accept -s; sandbox policy goes through a config override.
-      args.push("resume", resumeId, "--json", "--skip-git-repo-check", "-c", 'sandbox_mode="workspace-write"');
+      args.push("resume", resumeId, "--json", "--skip-git-repo-check", "-c", `sandbox_mode="${context.mode === "conversation" ? "read-only" : "workspace-write"}"`);
       if (this.modelId) args.push("-m", this.modelId);
     } else {
       args.push("--json", "--skip-git-repo-check", "-s", "workspace-write");
       if (this.modelId) args.push("-m", this.modelId);
+    }
+    if (context.mode === "conversation") {
+      const sandboxIndex = args.indexOf("workspace-write");
+      if (sandboxIndex >= 0) args[sandboxIndex] = "read-only";
     }
     args.push(prompt);
 
@@ -154,13 +158,13 @@ export class CodexCLIAdapter extends LocalAgentAdapter {
       }
 
       case "error": {
-        const message = event.message || event.error?.message || "Codex reported an error";
+        const message = event.message || this.describeError(event.error) || "Codex reported an error";
         this.recordFailure(sink, message);
         return true;
       }
 
       case "turn.failed": {
-        const message = event.error?.message || "Codex turn failed";
+        const message = this.describeError(event.error) || "Codex turn failed";
         this.recordFailure(sink, message);
         return true;
       }
@@ -207,7 +211,7 @@ export class CodexCLIAdapter extends LocalAgentAdapter {
       }
 
       case "error": {
-        const message = item.error?.message || item.message || "Codex item error";
+        const message = this.describeError(item.error) || item.message || "Codex item error";
         this.recordFailure(sink, message);
         break;
       }
@@ -226,6 +230,22 @@ export class CodexCLIAdapter extends LocalAgentAdapter {
     if (!sink.state.errors.some((e) => e.message === message)) {
       sink.error(message, { recoverable: false, authFailure: sink.state.authFailure });
     }
+  }
+
+  private describeError(error: unknown): string | undefined {
+    if (!error) return undefined;
+    if (typeof error === "string") return error;
+    if (typeof error === "object") {
+      const value = error as Record<string, unknown>;
+      const nested = [
+        value.message,
+        (value.data as Record<string, unknown> | undefined)?.message,
+        (value.cause as Record<string, unknown> | undefined)?.message,
+      ].find((item): item is string => typeof item === "string" && item.trim().length > 0);
+      if (nested) return nested;
+      try { return JSON.stringify(error).slice(0, 800); } catch { return undefined; }
+    }
+    return String(error);
   }
 
   protected inspectFailureText(text: string): { message: string; authFailure?: boolean } | null {

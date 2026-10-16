@@ -28,9 +28,11 @@ export interface ActionExecutionResult {
 
 export class ActionExecutor {
   private projectPath: string;
+  private browserContextProvider?: (action: any) => Promise<any>;
 
-  constructor(projectPath: string) {
+  constructor(projectPath: string, browserContextProvider?: (action: any) => Promise<any>) {
     this.projectPath = projectPath;
+    this.browserContextProvider = browserContextProvider;
   }
 
   /**
@@ -403,15 +405,23 @@ export class ActionExecutor {
     const url = data.url as string;
     const check = data.check as string;
 
-    // TODO: Implement actual browser checking via Puppeteer or similar
+    if (!this.browserContextProvider) {
+      return {
+        success: false,
+        actionId: id,
+        error: "Live browser context is unavailable because no overlay is connected.",
+      };
+    }
+
+    const pageContext = await this.browserContextProvider(action);
     return {
       success: true,
       actionId: id,
-      output: { url, check, result: "pending" },
+      output: { url, check, pageContext },
       observation: {
         type: "browser",
-        summary: `Browser check pending: ${url}`,
-        data: { url, check },
+        summary: `Captured live browser context${url ? ` for ${url}` : ""}`,
+        data: { url, check, pageContext },
       },
     };
   }

@@ -69,6 +69,12 @@ function stripAnsi(text: string): string {
   return text.replace(/\u001b\[[0-9;]*m/g, "").replace(/\u001b\][^\u0007]*\u0007/g, "");
 }
 
+/** OpenCode-hosted free models are restricted to OpenCode's own product UI. */
+export function isOpenCodeHeadlessRestrictedModel(modelId: string): boolean {
+  const id = modelId.trim().toLowerCase();
+  return id === "opencode/big-pickle" || id.endsWith("-free") || id.includes("-free-");
+}
+
 function parseJson<T = Record<string, unknown>>(stdout: string): T | null {
   const start = stdout.indexOf("{");
   if (start < 0) return null;
@@ -168,6 +174,7 @@ async function detectOpenCode(): Promise<DetectedBackend> {
       .split("\n")
       .map((line) => line.trim())
       .filter((line) => /^[a-z0-9-]+\/[a-z0-9._-]+$/i.test(line))
+      .filter((line) => !isOpenCodeHeadlessRestrictedModel(line))
       .slice(0, 30);
     base.models = ids.map((full) => {
       const name = full.split("/")[1];
@@ -179,10 +186,7 @@ async function detectOpenCode(): Promise<DetectedBackend> {
     });
   }
   if (base.models.length === 0) {
-    base.models = [
-      { id: "opencode:big-pickle", label: "Big Pickle", modelId: "opencode/big-pickle" },
-      { id: "opencode:deepseek-v4-flash", label: "DeepSeek V4 Flash", modelId: "opencode/deepseek-v4-flash" },
-    ];
+    base.models = [{ id: "opencode:claude-sonnet-4", label: "Claude Sonnet 4", modelId: "opencode/claude-sonnet-4" }];
   }
   return base;
 }

@@ -1600,6 +1600,21 @@ export function buildStyles(): string {
       position: relative;
     }
 
+    .lasso-model-chevron {
+      flex: 0 0 16px;
+      width: 16px;
+      height: 16px;
+      opacity: 0.72;
+      transition: transform 160ms ease, opacity 160ms ease;
+    }
+
+    .lasso-prompt-model[aria-expanded="true"] .lasso-model-chevron,
+    .lasso-command-model-btn[aria-expanded="true"] .lasso-model-chevron,
+    .lasso-cli-subgroup-header[aria-expanded="true"] .lasso-model-chevron {
+      transform: rotate(180deg);
+      opacity: 1;
+    }
+
     .lasso-prompt-model {
       height: 28px;
       max-width: 190px;
@@ -1718,7 +1733,7 @@ export function buildStyles(): string {
       cursor: pointer;
     }
     .lasso-cli-subgroup-header:hover { background: var(--lo-surface-hover); color: var(--lo-text); }
-    .lasso-cli-subgroup-chevron { color: var(--lo-text-3); font-size: 13px; line-height: 10px; }
+    .lasso-cli-subgroup-chevron { color: var(--lo-text-3); }
     .lasso-cli-subgroup-items { padding-left: 6px; }
 
     .lasso-model-item-icon {

@@ -34,6 +34,7 @@ interface LocalSessionRecord {
   status: RuntimeSession["status"];
   iteration: number;
   userPrompt: string;
+  mode: RuntimeSessionInput["mode"];
   conversation: RuntimeSession["conversation"];
   observations: RuntimeSession["observations"];
   actions: RuntimeSession["actions"];
@@ -73,6 +74,7 @@ export class LocalRuntime implements RuntimeFacade {
       status: "running",
       iteration: 0,
       userPrompt: input.userPrompt,
+      mode: input.mode || "task",
       conversation: [
         { id: crypto.randomUUID(), role: "user", content: input.userPrompt, timestamp: now.getTime() },
       ],
@@ -106,7 +108,7 @@ export class LocalRuntime implements RuntimeFacade {
     projectPath: string,
     onEvent: RuntimeEventHandler,
     signal?: AbortSignal,
-    _opts?: { providerApiKey?: string } // local agents run in-process; no server/model key needed
+    _opts?: { providerApiKey?: string; browserContextProvider?: (action: { id: string; type: "browser_check"; data?: Record<string, unknown> }) => Promise<unknown> } // local agents run in-process; no server/model key needed
   ): Promise<void> {
     const record = this.sessions.get(sessionId);
     if (!record) throw new Error("Session not found");
@@ -157,6 +159,7 @@ export class LocalRuntime implements RuntimeFacade {
         {
           taskId: record.id,
           userPrompt: record.userPrompt,
+          mode: record.mode,
           project: {
             projectId: record.project.projectId || "local",
             framework: record.project.framework,

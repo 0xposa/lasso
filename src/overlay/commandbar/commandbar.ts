@@ -6,7 +6,6 @@ import { showActivity } from "../collab/presence";
 import { collabEmit } from "../collab/socket";
 import { providerIcon, buildModelMenuContent } from "../prompt/prompt";
 import { setSelectMode } from "../toolbar/select";
-import { capturePageContext } from "../browser/context";
 import type { PendingChange } from "../types";
 
 export interface SourceChange {
@@ -463,10 +462,10 @@ export function buildCommandBar(): void {
       ></textarea>
       <div class="lasso-command-input-toolbar">
         <div class="lasso-command-model-select">
-          <button class="lasso-command-model-btn" type="button" aria-label="Select model">
+          <button class="lasso-command-model-btn" type="button" aria-label="Select model" aria-expanded="false" aria-haspopup="listbox">
             <span class="lasso-command-model-icon"></span>
             <span class="lasso-command-model-label"></span>
-            <svg class="lasso-command-model-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg class="lasso-model-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
               <path d="M6 9l6 6 6-6"/>
             </svg>
           </button>
@@ -547,7 +546,7 @@ export function buildCommandBar(): void {
     if (!commandHistoryPopover) return;
     const isHidden = commandHistoryPopover.hidden;
     if (isHidden) {
-      if (commandModelMenu) commandModelMenu.hidden = true;
+      setCommandModelMenuOpen(false);
       commandHistoryPopover.hidden = false;
       commandHistoryBtn?.classList.add("active");
       await loadConversationList();
@@ -567,6 +566,12 @@ export function buildCommandBar(): void {
   });
 
   // Model selector button
+  const setCommandModelMenuOpen = (open: boolean) => {
+    if (!commandModelMenu || !commandModelBtn) return;
+    commandModelMenu.hidden = !open;
+    commandModelBtn.setAttribute("aria-expanded", String(open));
+  };
+
   commandModelBtn.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -575,11 +580,11 @@ export function buildCommandBar(): void {
       commandHistoryBtn?.classList.remove("active");
     }
     if (commandModelMenu) {
-      const willOpen = commandModelMenu.hidden;
+      const willOpen = commandModelMenu?.hidden === true;
       if (willOpen) {
         populateModelMenu();
       }
-      commandModelMenu.hidden = !willOpen;
+      setCommandModelMenuOpen(willOpen);
     }
   });
 
@@ -606,7 +611,7 @@ export function buildCommandBar(): void {
       commandModelLabel.textContent = found.label;
     }
     populateModelMenu();
-    if (commandModelMenu) commandModelMenu.hidden = true;
+    setCommandModelMenuOpen(false);
   });
 
   // Close menus/popovers on outside click
@@ -617,7 +622,7 @@ export function buildCommandBar(): void {
     if (commandModelMenu && !commandModelMenu.hidden) {
       if (!path.includes(commandModelBtn!) && !path.includes(commandModelMenu)) {
         if (!commandModelBtn?.contains(target) && !commandModelMenu?.contains(target)) {
-          commandModelMenu.hidden = true;
+          setCommandModelMenuOpen(false);
         }
       }
     }
@@ -630,6 +635,12 @@ export function buildCommandBar(): void {
         }
       }
     }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || commandModelMenu?.hidden !== false) return;
+    setCommandModelMenuOpen(false);
+    commandModelBtn?.focus();
   });
 
   // Close button
@@ -840,6 +851,10 @@ export function closeCommandBar(): void {
   if (!commandBarEl) return;
 
   commandBarEl.hidden = true;
+  if (commandModelMenu) {
+    commandModelMenu.hidden = true;
+    commandModelBtn?.setAttribute("aria-expanded", "false");
+  }
   isOneShotMode = false;
 
   getDOM().shadow.querySelector<HTMLButtonElement>(".command-tool")?.classList.remove("active");
@@ -998,9 +1013,11 @@ async function runPrompt(prompt: string, skipUserMessage = false): Promise<void>
 
   const isChat = isConversationalPrompt(prompt);
 
-  // Append initial assistant message with thinking widget. The first step is
-  // the request itself — real model/action steps replace it as they arrive.
-  const initialStepTitle = prompt.length > 90 ? `${prompt.slice(0, 90)}…` : prompt;
+  // Append an assistant thinking widget without echoing the user's prompt.
+  // The prompt is already visible in the user bubble above; repeating it here
+  // makes the agent look like it is thinking aloud and is especially noisy for
+  // short messages such as "Hi".
+  const initialStepTitle = isChat ? "Preparing response…" : "Preparing the task";
   commandMessages.push({
     id: taskId,
     role: "assistant",
@@ -1045,14 +1062,6 @@ async function runPrompt(prompt: string, skipUserMessage = false): Promise<void>
     });
   }
 
-  // Capture live page context (viewport, visual snapshot, DOM headings & sections)
-  let pageContext: any = undefined;
-  try {
-    pageContext = await capturePageContext();
-  } catch (err) {
-    console.warn("[lasso] capturePageContext failed:", err);
-  }
-
   // Send request to bridge
   if (state.bridgeSocket?.readyState === WebSocket.OPEN) {
     state.bridgeSocket.send(
@@ -1064,10 +1073,17 @@ async function runPrompt(prompt: string, skipUserMessage = false): Promise<void>
         scope: "project",
         model: state.selectedModel.id,
         provider: state.selectedModel.provider,
+        // The current prompt is sent in its dedicated `prompt` field. Keep it
+        // out of history so the model sees it once, not once as history and
+        // once as the active request.
         messages: commandMessages
-          .filter((m) => m.content && !m.error)
+          .map((message, index) => ({ message, index }))
+          .filter(({ message, index }) => Boolean(message.content) && !message.error && index !== commandMessages.reduce(
+            (last, item, itemIndex) => item.role === "user" && item.content === prompt ? itemIndex : last,
+            -1,
+          ))
+          .map(({ message }) => message)
           .map((m) => ({ role: m.role, content: m.content })),
-        pageContext,
       })
     );
   } else {

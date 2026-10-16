@@ -16,6 +16,7 @@ import {
 import { setDragCardStatus, resetDrag } from "../drag/drag";
 import { elementKey } from "../toolbar/select";
 import { notifyAgent } from "../notifications";
+import { capturePageContext } from "../browser/context";
 import { getAgentTask, recordTaskActivity, recordTaskChangeHistory, updateAgentTask } from "../tasks/tasks";
 import {
   handleCommandBarAgentStatus,
@@ -123,7 +124,16 @@ export function connectBridge() {
           collab?: { projectId?: string; realtimeUrl?: string; name?: string; version?: string; workspaceId?: string; token?: string; apiKey?: string; plan?: string; configuredProviders?: string[] };
           user?: { name?: string; email?: string } | null;
           snapshots?: TimelineSnapshot[];
+          requestId?: string;
+          check?: Record<string, unknown>;
         };
+
+        if (message.type === "page_context_request" && message.requestId) {
+          void capturePageContext()
+            .then((pageContext) => send({ type: "page_context_response", requestId: message.requestId, pageContext }))
+            .catch((error) => send({ type: "page_context_response", requestId: message.requestId, error: error instanceof Error ? error.message : "Unable to capture page context." }));
+          return;
+        }
 
         if (message.type === "config") {
           state.apiKeyConfigured = Boolean(message.apiKeyConfigured);

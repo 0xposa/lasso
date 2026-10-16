@@ -16,6 +16,7 @@
 import { promisify } from "node:util";
 import { LocalAgentAdapter, LocalAgentConfig, CommandSpec, EventSink } from "./local-agent-adapter";
 import { BackendCapabilities, TaskContext } from "../backend-interface";
+import { isOpenCodeHeadlessRestrictedModel } from "../../cli/backends";
 
 const execFileAsync = promisify(require("node:child_process").execFile);
 
@@ -116,13 +117,21 @@ export class OpenCodeAdapter extends LocalAgentAdapter {
   }
 
   protected buildCommand(context: TaskContext): CommandSpec {
+    if (this.modelId && isOpenCodeHeadlessRestrictedModel(this.modelId)) {
+      throw new Error(
+        `OpenCode model ${this.modelId} is restricted to OpenCode's own app and cannot run through Lasso. Choose a non-free OpenCode model or configure another provider.`
+      );
+    }
     const resumeId = this.resumeSessionId(context);
     const args = ["run", "--format", "json"];
     if (this.modelId) args.push("-m", this.modelId);
     if (resumeId) args.push("--session", resumeId);
     args.push(this.buildTaskPrompt(context));
 
-    return { bin: "opencode", args, cwd: (this.config as OpenCodeConfig).projectPath };
+    const env = context.mode === "conversation"
+      ? { OPENCODE_PERMISSION: JSON.stringify({ "*": "deny" }) }
+      : undefined;
+    return { bin: "opencode", args, cwd: (this.config as OpenCodeConfig).projectPath, env };
   }
 
   protected handleLine(line: string, context: TaskContext, sink: EventSink): boolean {
@@ -197,12 +206,18 @@ export class OpenCodeAdapter extends LocalAgentAdapter {
     if (typeof error === "string") return error;
     if (typeof error === "object") {
       const e = error as Record<string, unknown>;
-      if (typeof e.message === "string") return e.message;
-      if (typeof e.name === "string") return e.name;
+      const nested = [
+        e.message,
+        (e.data as Record<string, unknown> | undefined)?.message,
+        (e.data as Record<string, unknown> | undefined)?.error,
+        (e.cause as Record<string, unknown> | undefined)?.message,
+      ].find((item): item is string => typeof item === "string" && item.trim().length > 0);
+      if (nested) return nested;
       try {
-        return JSON.stringify(error).slice(0, 400);
+        const serialized = JSON.stringify(error).slice(0, 800);
+        return typeof e.name === "string" ? `${e.name}: ${serialized}` : serialized;
       } catch {
-        return undefined;
+        return typeof e.name === "string" ? e.name : undefined;
       }
     }
     return String(error);

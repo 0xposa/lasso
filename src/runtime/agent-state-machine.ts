@@ -34,7 +34,7 @@ export class AgentStateMachine {
    */
   private static readonly ALLOWED_ACTIONS: Record<AgentPhase, string[]> = {
     understand: [],
-    inspect: ["read_file", "search_code", "inspect_project"],
+    inspect: ["read_file", "search_code", "inspect_project", "browser_check"],
     plan: [],
     execute: ["edit_file", "create_file", "delete_file", "run_command"],
     verify: ["browser_check", "run_command"],

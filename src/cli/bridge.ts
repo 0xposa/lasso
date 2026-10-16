@@ -10,7 +10,7 @@ import type { CollabConfig, WorkspaceConfig, ModelsResponse } from "./project";
 import { resolveLassoApiKey, resolveWorkspaceConfig, fetchModels } from "./project";
 import { serverUrlFrom, loadCredentials } from "./auth";
 import { createSnapshot, restoreSnapshot, getTimeline, deleteSnapshot, getSnapshotByTaskId, getSnapshotBySessionId, type TimelineSnapshot } from "./snapshot";
-import { RuntimeClient, type RuntimeSessionInput, type RuntimeEvent, type RuntimeSession, type RuntimeFacade } from "./runtime-client";
+import { RuntimeClient, type RuntimeSessionInput, type RuntimeEvent, type RuntimeSession, type RuntimeFacade, type BrowserContextProvider } from "./runtime-client";
 import { detectBackends, modelIdForBackend, type DetectedBackend, type LocalAgentProvider } from "./backends";
 import { getLocalRuntime } from "./local-runtime";
 
@@ -39,13 +39,41 @@ export type BridgeMessage =
   | { type: "git_push" }
   | { type: "agent_status"; taskId?: string; status: "thinking" | "working" | "review" | "error" | "stopped"; message: string }
   | { type: "transcribe"; requestId: string; audio: string; mimeType?: string; language?: string }
-  | { type: "oneshot"; prompt: string; scope?: "project" | "component"; model?: string; provider?: "anthropic" | "openai" | "google" | "nvidia" | "ollama" | "claude_code" | "opencode" | "codex_cli" | "cursor"; messages?: Array<{ role: "user" | "assistant"; content: string }>; taskId?: string; pageContext?: any }
+  | { type: "oneshot"; prompt: string; scope?: "project" | "component"; model?: string; provider?: "anthropic" | "openai" | "google" | "nvidia" | "ollama" | "claude_code" | "opencode" | "codex_cli" | "cursor"; messages?: Array<{ role: "user" | "assistant"; content: string }>; taskId?: string }
+  | { type: "page_context_response"; requestId: string; pageContext?: any; error?: string }
   | { type: "restore_snapshot"; snapshotId: string }
   | { type: "get_timeline" }
   | { type: "delete_snapshot"; snapshotId: string }
   | { type: "switch_model"; taskId: string; provider: string; modelId: string };
 
 type ModelOption = { id: string; label: string; provider: Provider; locked?: boolean; lockedReason?: string };
+
+function isConversationalPrompt(prompt: string): boolean {
+  const value = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
+  if (/^(hi|hello|hey|heya|howdy|sup|yo|good morning|good afternoon|good evening|thanks|thank you|thx|ty|what can you do|what can i ask you|who are you|how do you work|how does this work)$/.test(value)) return true;
+  if (/^(what can you do|what can i ask|who are you|how do you work|how does this work)\b/.test(value)) return true;
+  if (/^(what is|what's|how do i|why does|can you explain|tell me about)\b/.test(value)) return true;
+  return false;
+}
+
+function cleanConversationReply(value: unknown): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "I’m ready when you are.";
+  try {
+    const parsed = JSON.parse(text);
+    if (typeof parsed?.reply === "string") return parsed.reply.trim();
+  } catch {
+    const match = text.match(/"reply"\s*:\s*"((?:\\.|[^"\\])*)"/);
+    if (match) {
+      try {
+        return JSON.parse(`"${match[1]}"`).trim();
+      } catch {
+        return match[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').trim();
+      }
+    }
+  }
+  return text;
+}
 type PageEntry = { name: string; path: string; type: "directory" | "file" };
 
 export type ServerBridgeMessage =
@@ -180,6 +208,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
   // in this process), RuntimeClient for hosted models (via Lasso server).
   const taskFacades = new Map<string, RuntimeFacade>();
   const taskControllers = new Map<string, AbortController>();
+  const pendingBrowserContext = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
   const correctiveAttempts = new Map<string, number>();
   const envRoots = [cwd, path.join(cwd, "web"), path.join(cwd, "server")];
   const fileEnv = envRoots.reduce<Record<string, string>>((values, root) => ({
@@ -203,6 +232,17 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       if (value) return value;
     }
     return undefined;
+  }
+
+  function requestBrowserContext(action: { id: string; type: "browser_check"; data?: Record<string, unknown> }, taskId: string): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (!overlaySocket || overlaySocket.readyState !== overlaySocket.OPEN) {
+        reject(new Error("Live browser context is unavailable because the overlay is disconnected."));
+        return;
+      }
+      pendingBrowserContext.set(action.id, { resolve, reject });
+      overlaySocket.send(JSON.stringify({ type: "page_context_request", requestId: action.id, taskId, check: action.data || {} }));
+    });
   }
 
   const cliCredentials = loadCredentials();
@@ -321,8 +361,8 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
     switch (event.type) {
       case "agent_started":
-        // No canned step — the command bar's initial step (the user's own
-        // request) is already running; the next real event replaces it.
+        // The command bar owns the neutral initial status; real runtime events
+        // replace it as soon as the agent has useful progress to report.
         break;
 
       case "agent_reasoning": {
@@ -446,6 +486,25 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     }
   }
 
+  async function sendLocalConversationReply(
+    facade: RuntimeFacade,
+    session: RuntimeSession,
+    taskId: string,
+    socket: WebSocket
+  ): Promise<void> {
+    const finalSession = await facade.getSession(session.id);
+    const messages = (finalSession as any).conversation || [];
+    const reply = [...messages]
+      .reverse()
+      .find((message: any) => message?.role === "assistant" && typeof message.content === "string")?.content?.trim();
+    if (!reply) return;
+    socket.send(JSON.stringify({
+      type: "assistant_message",
+      taskId,
+      message: reply,
+    } satisfies ServerBridgeMessage));
+  }
+
   // The server rolled the workspace back before review, so the current files
   // are the originals: capture them for undo, then open the review panel.
   async function handleReviewReady(
@@ -492,6 +551,86 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
   }
 
   // Handler for edit/ask - uses runtime
+  async function handleHostedConversation(
+    taskId: string,
+    prompt: string,
+    model: string,
+    provider: string,
+    messages: any[] | undefined,
+    socket: WebSocket,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const requestController = new AbortController();
+    const abortRequest = () => requestController.abort();
+    signal.addEventListener("abort", abortRequest, { once: true });
+    const timeout = setTimeout(() => {
+      if (!signal.aborted) socket.send(JSON.stringify({
+        type: "agent_status",
+        taskId,
+        status: "error",
+        message: "The conversation timed out. Please try again.",
+      } satisfies ServerBridgeMessage));
+      requestController.abort();
+    }, 30_000);
+    try {
+      const response = await fetch(`${serverUrl}/api/v1/agent/session`, {
+        method: "POST",
+        headers: {
+          Accept: "text/event-stream",
+          "Content-Type": "application/json",
+          ...(resolvedLassoKey ? { Authorization: `Bearer ${resolvedLassoKey}` } : {}),
+        },
+        body: JSON.stringify({
+          prompt,
+          model: { id: model, provider },
+          messages: Array.isArray(messages) ? messages : undefined,
+        }),
+        signal: requestController.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Conversation request failed (${response.status})`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const payload = line.slice(6).trim();
+          if (!payload || payload === "[DONE]") continue;
+          const event = JSON.parse(payload);
+          if (event.type === "error") throw new Error(event.error || "Conversation failed");
+          if (event.type === "done") {
+            socket.send(JSON.stringify({
+              type: "assistant_message",
+              taskId,
+              message: cleanConversationReply(event.reply || event.summary),
+            } satisfies ServerBridgeMessage));
+          }
+        }
+      }
+    } catch (error) {
+      if (signal.aborted) return;
+      socket.send(JSON.stringify({
+        type: "agent_status",
+        taskId,
+        status: "error",
+        message: error instanceof Error ? error.message : "Conversation failed",
+      } satisfies ServerBridgeMessage));
+    } finally {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abortRequest);
+      taskControllers.delete(taskId);
+    }
+  }
+
   async function handleEditOrAsk(
     message: any,
     socket: WebSocket,
@@ -507,22 +646,30 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     const controller = new AbortController();
     taskControllers.set(taskId, controller);
 
-    // First step = the user's own instruction (dynamic), not canned copy.
+    const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
+    if (message.type === "ask" && !isLocalAgent) {
+      await handleHostedConversation(taskId, instruction, model, provider, messages, socket, controller.signal);
+      return;
+    }
+
+    // Do not echo the user's prompt into the thinking feed. The prompt is
+    // already visible in the conversation; use a neutral status while the
+    // runtime produces its first useful event.
     socket.send(JSON.stringify({
       type: "agent_status",
       taskId,
       status: "thinking",
-      message: instruction.length > 90 ? `${instruction.slice(0, 90)}…` : instruction,
+      message: "Thinking…",
     } satisfies ServerBridgeMessage));
 
     try {
-      const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
       // Overlay model option ids are prefixed ("claude_code:sonnet") — the
       // agent CLIs need the unprefixed/normalized form.
       const backendModelId = modelIdForBackend(model || "", provider || "");
       
       const sessionInput: RuntimeSessionInput = {
         userPrompt: instruction,
+        mode: message.type === "ask" && isConversationalPrompt(instruction) ? "conversation" : "task",
         project: {
           projectId,
           framework,
@@ -561,9 +708,14 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       // Originals are captured when the review is ready (the workspace was
       // already rolled back at that point).
 
+      const conversationOnly = message.type === "ask" && isConversationalPrompt(instruction);
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
-        handleRuntimeEvent(event, socket, taskId, session, `Runtime session: ${instruction}`, true);
-      }, controller.signal, { providerApiKey: providerApiKeyFor(provider) });
+        handleRuntimeEvent(event, socket, taskId, session, `Runtime session: ${instruction}`, !conversationOnly);
+      }, controller.signal, {
+        providerApiKey: providerApiKeyFor(provider),
+        browserContextProvider: ((action) => requestBrowserContext(action, taskId)) as BrowserContextProvider,
+      });
+      if (conversationOnly) await sendLocalConversationReply(facade, session, taskId, socket);
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
@@ -836,15 +988,21 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     const controller = new AbortController();
     taskControllers.set(taskId, controller);
 
-    // No canned "Starting oneshot..." step: the command bar shows the
-    // user's own request as the initial step; real events take it from there.
+    // Greetings and conversational messages still go through the selected
+    // agent/model. The overlay only skips expensive page capture for them;
+    // there are no canned assistant responses in the bridge.
 
     try {
       const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
+      if (isConversationalPrompt(prompt) && !isLocalAgent) {
+        await handleHostedConversation(taskId, prompt, model, provider, message.messages, socket, controller.signal);
+        return;
+      }
       const backendModelId = modelIdForBackend(model || "", provider || "");
       
       const sessionInput: RuntimeSessionInput = {
         userPrompt: prompt,
+        mode: isConversationalPrompt(prompt) ? "conversation" : "task",
         project: {
           projectId,
           framework,
@@ -872,15 +1030,9 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
         // Oneshot results are reviewed exactly like edit/ask: the workspace is
         // rolled back and only approval re-applies the changes.
-        handleRuntimeEvent(event, socket, taskId, session, `Oneshot: ${instruction}`, true);
-        if (event.type === "agent_completed") {
-          socket.send(JSON.stringify({
-            type: "assistant_message",
-            taskId,
-            message: "Oneshot completed",
-          } satisfies ServerBridgeMessage));
-        }
+        handleRuntimeEvent(event, socket, taskId, session, `Oneshot: ${instruction}`, !isConversationalPrompt(prompt));
       }, controller.signal, { providerApiKey: providerApiKeyFor(provider) });
+      if (isConversationalPrompt(prompt)) await sendLocalConversationReply(facade, session, taskId, socket);
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",

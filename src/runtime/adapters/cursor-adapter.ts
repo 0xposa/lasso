@@ -139,7 +139,7 @@ export class CursorAdapter extends LocalAgentAdapter {
 
   protected buildCommand(context: TaskContext): CommandSpec {
     const resumeId = this.resumeSessionId(context);
-    const args = ["-p", "--output-format", "stream-json", "--trust"];
+    const args = ["-p", "--output-format", context.mode === "conversation" ? "json" : "stream-json", "--trust"];
     if (this.modelId) args.push("--model", this.modelId);
     if (resumeId) args.push("--resume", resumeId);
     args.push(this.buildTaskPrompt(context));

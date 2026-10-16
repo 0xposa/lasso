@@ -155,6 +155,9 @@ export interface TaskContext {
    */
   userPrompt: string;
 
+  /** Whether the backend should answer conversationally without project work. */
+  mode?: "conversation" | "task";
+
   /**
    * Project context
    */

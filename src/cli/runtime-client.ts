@@ -31,6 +31,8 @@ export type RuntimeProvider =
 
 export interface RuntimeSessionInput {
   userPrompt: string;
+  /** Conversation-only requests must not enter the coding/tool workflow. */
+  mode?: "conversation" | "task";
   project: {
     projectId: string;
     framework?: string;
@@ -70,6 +72,8 @@ export interface RuntimeSessionInput {
     projectPath?: string;
   };
 }
+
+export type BrowserContextProvider = (action: { id: string; type: "browser_check"; data?: Record<string, unknown> }) => Promise<unknown>;
 
 export interface RuntimeSession {
   id: string;
@@ -153,7 +157,7 @@ export interface RuntimeFacade {
     projectPath: string,
     onEvent: RuntimeEventHandler,
     signal?: AbortSignal,
-    opts?: { providerApiKey?: string }
+    opts?: { providerApiKey?: string; browserContextProvider?: BrowserContextProvider }
   ): Promise<void>;
   getSession(sessionId: string): Promise<RuntimeSession>;
   verifySession(sessionId: string, projectPath: string): Promise<SessionVerificationResult>;
@@ -268,7 +272,7 @@ export class RuntimeClient {
     projectPath: string,
     onEvent: RuntimeEventHandler,
     signal?: AbortSignal,
-    opts?: { providerApiKey?: string }
+    opts?: { providerApiKey?: string; browserContextProvider?: BrowserContextProvider }
   ): Promise<void> {
     // CLI-side snapshot: nothing the agent does is left on disk before review.
     let guard: WorkspaceGuard | null = null;
@@ -278,7 +282,7 @@ export class RuntimeClient {
       console.error("WorkspaceGuard capture failed:", error);
     }
 
-    const executor = new ActionExecutor(projectPath);
+    const executor = new ActionExecutor(projectPath, opts?.browserContextProvider);
     const verifier = new VerificationEngine(projectPath);
 
     const finalizeGuard = async () => {

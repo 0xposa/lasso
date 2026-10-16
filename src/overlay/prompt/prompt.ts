@@ -169,9 +169,9 @@ export function buildPrompt(): { prompt: HTMLDivElement; review: HTMLDivElement 
           </button>
 
           <div class="lasso-prompt-model-wrap">
-            <button class="lasso-prompt-model" type="button" aria-label="Choose model">
+            <button class="lasso-prompt-model" type="button" aria-label="Choose model" aria-expanded="false" aria-haspopup="listbox">
               <span class="lasso-prompt-model-name"></span>
-              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <svg class="lasso-model-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M6 9l6 6 6-6"/>
               </svg>
             </button>
@@ -360,10 +360,16 @@ export function buildPrompt(): { prompt: HTMLDivElement; review: HTMLDivElement 
   promptTop.addEventListener("pointercancel", stopPromptDrag);
 
   // Model Menu
+  const setModelMenuOpen = (open: boolean) => {
+    if (!modelMenu || !modelBtn) return;
+    modelMenu.hidden = !open;
+    modelBtn.setAttribute("aria-expanded", String(open));
+  };
+
   modelBtn.addEventListener("click", (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (modelMenu) modelMenu.hidden = !modelMenu.hidden;
+    setModelMenuOpen(modelMenu?.hidden === true);
   });
 
   modelMenu.addEventListener("click", (event) => {
@@ -383,7 +389,7 @@ export function buildPrompt(): { prompt: HTMLDivElement; review: HTMLDivElement 
     state.selectedModel = found;
     rememberModel(found);
     syncModelMenu();
-    if (modelMenu) modelMenu.hidden = true;
+    setModelMenuOpen(false);
   });
 
   document.addEventListener("click", (event) => {
@@ -392,7 +398,13 @@ export function buildPrompt(): { prompt: HTMLDivElement; review: HTMLDivElement 
     if (path.includes(modelBtn!) || path.includes(modelMenu)) return;
     const target = event.target as Node;
     if (modelBtn?.contains(target) || modelMenu?.contains(target)) return;
-    modelMenu.hidden = true;
+    setModelMenuOpen(false);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || modelMenu?.hidden !== false) return;
+    setModelMenuOpen(false);
+    modelBtn?.focus();
   });
 
   refreshModelMenu();
@@ -716,7 +728,7 @@ export function buildModelMenuContent(menuEl: HTMLElement, onRefresh: () => void
         subHeader.type = "button";
         subHeader.className = "lasso-cli-subgroup-header";
         subHeader.setAttribute("aria-expanded", String(openCliGroups.has(cliKey)));
-        subHeader.innerHTML = `<span>${providerLabels[cliKey as ModelOption["provider"]] || cliKey}</span><span class="lasso-cli-subgroup-chevron">${openCliGroups.has(cliKey) ? "⌃" : "⌄"}</span>`;
+        subHeader.innerHTML = `<span>${providerLabels[cliKey as ModelOption["provider"]] || cliKey}</span><svg class="lasso-model-chevron lasso-cli-subgroup-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>`;
         const subItems = document.createElement("div");
         subItems.className = "lasso-cli-subgroup-items";
         subItems.hidden = !openCliGroups.has(cliKey);
@@ -1351,9 +1363,14 @@ export async function handleSend(event: MouseEvent) {
     Array.from(selectedElement.attributes).map((attr) => [attr.name, attr.value])
   );
   const needsVisualContext = /\b(look|visual|appearance|color|colour|background|image|icon|spacing|layout|position|align|responsive|style|restyle|font|size)\b/i.test(instruction);
-  const screenshots = needsVisualContext
-    ? await captureElementScreenshot(selectedElement)
-    : await screenshotPromise;
+  // Conversational questions do not need an element screenshot. Keep the
+  // answer path light; visual context remains available for actual edits or
+  // explicit visual questions through the demand-driven browser tool.
+  const screenshots = wantsAnswer
+    ? undefined
+    : needsVisualContext
+      ? await captureElementScreenshot(selectedElement)
+      : await screenshotPromise;
 
   if (bridgeSocket.readyState !== WebSocket.OPEN) {
     const message = "The Lasso agent bridge disconnected before the task could start.";
