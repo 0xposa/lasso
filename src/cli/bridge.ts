@@ -49,10 +49,39 @@ export type BridgeMessage =
 type ModelOption = { id: string; label: string; provider: Provider; locked?: boolean; lockedReason?: string };
 
 function isConversationalPrompt(prompt: string): boolean {
-  const value = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
-  if (/^(hi|hello|hey|heya|howdy|sup|yo|good morning|good afternoon|good evening|thanks|thank you|thx|ty|what can you do|what can i ask you|who are you|how do you work|how does this work)$/.test(value)) return true;
-  if (/^(what can you do|what can i ask|who are you|how do you work|how does this work)\b/.test(value)) return true;
-  if (/^(what is|what's|how do i|why does|can you explain|tell me about)\b/.test(value)) return true;
+  const p = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
+  
+  // 1. Direct greetings and conversational niceties
+  const greetings = [
+    "hi", "hello", "hey", "heya", "howdy", "sup", "yo",
+    "good morning", "good afternoon", "good evening",
+    "thanks", "thank you", "thx", "ty", "cool", "awesome", "great", "nice",
+    "who are you", "what are you", "what can you do", "help", "help me",
+    "what is lasso", "how do you work", "how does this work",
+  ];
+  if (greetings.includes(p)) return true;
+
+  // Short greetings
+  if (/^(hi|hello|hey|howdy|yo)\b/i.test(p) && p.split(/\s+/).length <= 4) {
+    const buildKeywords = /\b(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code)\b/i;
+    if (!buildKeywords.test(p)) return true;
+  }
+
+  // 2. Action verbs indicating deliberate code changes
+  const mutationVerbs = /\b(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code|replace|set|switch|swap|rewrite|restyle|rebuild|apply)\b/i;
+
+  // 3. Question / informational prefixes
+  const infoPrefixes = /^(what|how|why|when|where|who|which|can you explain|explain|describe|tell me|check out|check|look at|summarize|give me an overview|overview|inspect)\b/i;
+
+  if (infoPrefixes.test(p) && !mutationVerbs.test(p)) {
+    return true;
+  }
+
+  // 4. Questions about the project / app / page without mutation verbs
+  if (/\b(about|doing|does this|is this|mean|purpose|work|repo|project|codebase|app|application|page|overview|summary)\b/i.test(p) && !mutationVerbs.test(p)) {
+    return true;
+  }
+
   return false;
 }
 
@@ -540,11 +569,19 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
         createSnapshot(cwd, taskId, instruction, changes.map((change: any) => change.filePath), undefined, session.id);
 
+        // Extract the assistant's reply from the session conversation so the user
+        // sees both the explanation and the review panel — not just "Review changes".
+        const sessionConvo = (finalSession as any).conversation || [];
+        const assistantReply = [...sessionConvo]
+          .reverse()
+          .find((m: any) => m?.role === "assistant" && typeof m.content === "string")
+          ?.content?.trim();
+
         socket.send(JSON.stringify({
           type: "agent_status",
           taskId,
           status: "review",
-          message: "Review changes",
+          message: assistantReply || "Review changes",
           changes,
         } satisfies ServerBridgeMessage));
       } else {

@@ -75,6 +75,8 @@ let conversationList: Array<{ id: string; title: string; scope: string; updatedA
 
 export function isConversationalPrompt(prompt: string): boolean {
   const p = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
+
+  // 1. Direct greetings and conversational niceties
   const greetings = [
     "hi", "hello", "hey", "heya", "howdy", "sup", "yo",
     "good morning", "good afternoon", "good evening",
@@ -83,15 +85,27 @@ export function isConversationalPrompt(prompt: string): boolean {
     "what is lasso", "how do you work", "how does this work",
   ];
   if (greetings.includes(p)) return true;
+
+  // Short greetings (≤ 4 words, no build keywords)
   if (/^(hi|hello|hey|howdy|yo)\b/i.test(p) && p.split(/\s+/).length <= 4) {
-    const buildKeywords = /(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code)/i;
+    const buildKeywords = /\b(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code)\b/i;
     if (!buildKeywords.test(p)) return true;
   }
-  const questionOnly = /^(what is|what's|how do i|why does|can you explain|tell me about)\b/i.test(p);
-  const actionVerbs = /(build|create|add|make|fix|update|modify|change|refactor|implement|write code|code this|delete|remove|generate)/i;
-  if (questionOnly && !actionVerbs.test(p)) {
+
+  // 2. Action verbs indicating deliberate code changes
+  const mutationVerbs = /\b(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code|replace|set|switch|swap|rewrite|restyle|rebuild|apply)\b/i;
+
+  // 3. Question / informational prefixes
+  const infoPrefixes = /^(what|how|why|when|where|who|which|can you explain|explain|describe|tell me|check out|check|look at|summarize|give me an overview|overview|inspect)\b/i;
+  if (infoPrefixes.test(p) && !mutationVerbs.test(p)) {
     return true;
   }
+
+  // 4. Questions about the project / app / page without mutation verbs
+  if (/\b(about|doing|does this|is this|mean|purpose|work|repo|project|codebase|app|application|page|overview|summary)\b/i.test(p) && !mutationVerbs.test(p)) {
+    return true;
+  }
+
   return false;
 }
 

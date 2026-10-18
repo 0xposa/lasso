@@ -71,6 +71,17 @@ const DEFAULT_IGNORE_DIRS = new Set([
   ".terraform",
 ]);
 
+const DEFAULT_IGNORE_FILES = new Set([
+  "next-env.d.ts",
+  "tsconfig.tsbuildinfo",
+  ".DS_Store",
+  "Thumbs.db",
+]);
+
+function shouldIgnoreFile(name: string): boolean {
+  return DEFAULT_IGNORE_FILES.has(name) || name.endsWith(".tsbuildinfo");
+}
+
 type CapturedEntry = {
   /** Absolute original path */
   absPath: string;
@@ -153,8 +164,8 @@ export class WorkspaceGuard {
           walk(absPath, relPath, depth + 1);
           continue;
         }
-        if (!entry.isFile()) {
-          guard.skipped.push(relPath);
+        if (!entry.isFile() || shouldIgnoreFile(entry.name)) {
+          if (!entry.isFile()) guard.skipped.push(relPath);
           continue;
         }
 
@@ -328,7 +339,7 @@ export class WorkspaceGuard {
           walk(absPath, relPath, depth + 1);
           continue;
         }
-        if (!entry.isFile()) continue;
+        if (!entry.isFile() || shouldIgnoreFile(entry.name)) continue;
         if (this.ignoreFn && this.ignoreFn(relPath, false)) continue;
         if (capturedPaths.has(relPath)) continue;
 
