@@ -1271,13 +1271,38 @@ export function handleCommandBarAction(message: any): void {
 }
 
 export function handleCommandBarPrompt(message: any): void {
-  // Can be used if agent asks permission or input
-  if (message.prompt?.question) {
-    const targetMsg = [...commandMessages].reverse().find((m) => m.role === "assistant");
-    if (targetMsg) {
-      targetMsg.content += `\n\n**${message.prompt.question}**`;
-      renderMessages();
-    }
+  const taskId = message.taskId;
+  let targetMsg = commandMessages.find((m) => m.id === taskId);
+  if (!targetMsg) {
+    targetMsg = [...commandMessages].reverse().find((m) => m.role === "assistant");
+  }
+  if (!targetMsg) return;
+
+  if (activeThinkingInterval) {
+    clearInterval(activeThinkingInterval);
+    activeThinkingInterval = null;
+  }
+
+  // Pure conversational prompt / question — remove thinking widget so the response is front-and-center
+  targetMsg.thinking = undefined;
+
+  const question = message.prompt?.question || message.message || "";
+  targetMsg.content = question;
+  targetMsg.isStreaming = false;
+  activeTaskId = null;
+  updateSubmitButton(false);
+
+  // Unblock teammates — Build Mode is over
+  collabEmit("collab:action", {
+    sessionId: state.collabProjectId,
+    status: "idle",
+  });
+
+  renderMessages();
+  scrollToBottom();
+
+  if (commandInput) {
+    commandInput.focus();
   }
 }
 
