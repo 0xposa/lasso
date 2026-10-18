@@ -48,17 +48,9 @@ export type BridgeMessage =
 
 type ModelOption = { id: string; label: string; provider: Provider; locked?: boolean; lockedReason?: string };
 
-function isConversationalPrompt(prompt: string): boolean {
-  const value = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
-  if (/^(hi|hello|hey|heya|howdy|sup|yo|good morning|good afternoon|good evening|thanks|thank you|thx|ty|what can you do|what can i ask you|who are you|how do you work|how does this work)$/.test(value)) return true;
-  if (/^(what can you do|what can i ask|who are you|how do you work|how does this work)\b/.test(value)) return true;
-  if (/^(what is|what's|how do i|why does|can you explain|tell me about)\b/.test(value)) return true;
-  return false;
-}
-
 function cleanConversationReply(value: unknown): string {
   const text = typeof value === "string" ? value.trim() : "";
-  if (!text) return "I’m ready when you are.";
+  if (!text) return "";
   try {
     const parsed = JSON.parse(text);
     if (typeof parsed?.reply === "string") return parsed.reply.trim();
@@ -497,12 +489,20 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     const reply = [...messages]
       .reverse()
       .find((message: any) => message?.role === "assistant" && typeof message.content === "string")?.content?.trim();
-    if (!reply) return;
-    socket.send(JSON.stringify({
-      type: "assistant_message",
-      taskId,
-      message: reply,
-    } satisfies ServerBridgeMessage));
+    if (reply) {
+      socket.send(JSON.stringify({
+        type: "assistant_message",
+        taskId,
+        message: reply,
+      } satisfies ServerBridgeMessage));
+    } else {
+      socket.send(JSON.stringify({
+        type: "agent_status",
+        taskId,
+        status: "stopped",
+        message: "Complete",
+      } satisfies ServerBridgeMessage));
+    }
   }
 
   // The server rolled the workspace back before review, so the current files
@@ -531,15 +531,17 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
         }));
 
         createSnapshot(cwd, taskId, instruction, changes.map((change: any) => change.filePath), undefined, session.id);
-      }
 
-      socket.send(JSON.stringify({
-        type: "agent_status",
-        taskId,
-        status: "review",
-        message: changes.length > 0 ? "Review changes" : "No file changes were produced",
-        changes,
-      } satisfies ServerBridgeMessage));
+        socket.send(JSON.stringify({
+          type: "agent_status",
+          taskId,
+          status: "review",
+          message: "Review changes",
+          changes,
+        } satisfies ServerBridgeMessage));
+      } else {
+        await sendLocalConversationReply(facade, session, taskId, socket);
+      }
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
@@ -669,7 +671,6 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       
       const sessionInput: RuntimeSessionInput = {
         userPrompt: instruction,
-        mode: message.type === "ask" && isConversationalPrompt(instruction) ? "conversation" : "task",
         project: {
           projectId,
           framework,
@@ -708,14 +709,12 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       // Originals are captured when the review is ready (the workspace was
       // already rolled back at that point).
 
-      const conversationOnly = message.type === "ask" && isConversationalPrompt(instruction);
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
-        handleRuntimeEvent(event, socket, taskId, session, `Runtime session: ${instruction}`, !conversationOnly);
+        handleRuntimeEvent(event, socket, taskId, session, `Runtime session: ${instruction}`, true);
       }, controller.signal, {
         providerApiKey: providerApiKeyFor(provider),
         browserContextProvider: ((action) => requestBrowserContext(action, taskId)) as BrowserContextProvider,
       });
-      if (conversationOnly) await sendLocalConversationReply(facade, session, taskId, socket);
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",
@@ -994,15 +993,10 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
     try {
       const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
-      if (isConversationalPrompt(prompt) && !isLocalAgent) {
-        await handleHostedConversation(taskId, prompt, model, provider, message.messages, socket, controller.signal);
-        return;
-      }
       const backendModelId = modelIdForBackend(model || "", provider || "");
       
       const sessionInput: RuntimeSessionInput = {
         userPrompt: prompt,
-        mode: isConversationalPrompt(prompt) ? "conversation" : "task",
         project: {
           projectId,
           framework,
@@ -1030,9 +1024,8 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
       await facade.runSession(session.id, cwd, (event: RuntimeEvent) => {
         // Oneshot results are reviewed exactly like edit/ask: the workspace is
         // rolled back and only approval re-applies the changes.
-        handleRuntimeEvent(event, socket, taskId, session, `Oneshot: ${instruction}`, !isConversationalPrompt(prompt));
+        handleRuntimeEvent(event, socket, taskId, session, `Oneshot: ${instruction}`, true);
       }, controller.signal, { providerApiKey: providerApiKeyFor(provider) });
-      if (isConversationalPrompt(prompt)) await sendLocalConversationReply(facade, session, taskId, socket);
     } catch (error) {
       socket.send(JSON.stringify({
         type: "agent_status",

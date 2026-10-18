@@ -72,27 +72,6 @@ let activeStartTime = 0;
 let activeConversationId: string | null = null;
 let conversationList: Array<{ id: string; title: string; scope: string; updatedAt: string }> = [];
 
-export function isConversationalPrompt(prompt: string): boolean {
-  const p = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
-  const greetings = [
-    "hi", "hello", "hey", "heya", "howdy", "sup", "yo",
-    "good morning", "good afternoon", "good evening",
-    "thanks", "thank you", "thx", "ty", "cool", "awesome", "great", "nice",
-    "who are you", "what are you", "what can you do", "help", "help me",
-    "what is lasso", "how do you work", "how does this work",
-  ];
-  if (greetings.includes(p)) return true;
-  if (/^(hi|hello|hey|howdy|yo)\b/i.test(p) && p.split(/\s+/).length <= 4) {
-    const buildKeywords = /(build|create|add|make|fix|update|modify|change|refactor|implement|delete|remove|style|install|wire|code)/i;
-    if (!buildKeywords.test(p)) return true;
-  }
-  const questionOnly = /^(what is|what's|how do i|why does|can you explain|tell me about)\b/i.test(p);
-  const actionVerbs = /(build|create|add|make|fix|update|modify|change|refactor|implement|write code|code this|delete|remove|generate)/i;
-  if (questionOnly && !actionVerbs.test(p)) {
-    return true;
-  }
-  return false;
-}
 
 /** Detects "try again", "retry", "do it again", "run again", etc. */
 export function isRetryIntent(prompt: string): boolean {
@@ -1011,13 +990,11 @@ async function runPrompt(prompt: string, skipUserMessage = false): Promise<void>
   activeTaskId = taskId;
   activeStartTime = Date.now();
 
-  const isChat = isConversationalPrompt(prompt);
-
   // Append an assistant thinking widget without echoing the user's prompt.
   // The prompt is already visible in the user bubble above; repeating it here
   // makes the agent look like it is thinking aloud and is especially noisy for
   // short messages such as "Hi".
-  const initialStepTitle = isChat ? "Preparing response…" : "Preparing the task";
+  const initialStepTitle = "Thinking…";
   commandMessages.push({
     id: taskId,
     role: "assistant",

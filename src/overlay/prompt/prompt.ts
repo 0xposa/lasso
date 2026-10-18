@@ -1292,12 +1292,6 @@ export async function handleSend(event: MouseEvent) {
 
   requestAgentNotificationPermission();
 
-  const isQuestionPrefix = /^(what|why|how|when|where|who|which|explain|describe|tell me about)\b/i.test(instruction);
-  const isImperativeEdit = /\b(can|could|would|please)\s+(you\s+)?(change|edit|update|add|fix|make|replace|remove|install|redesign|switch|swap|set)\b/i.test(instruction);
-  const isConversationalQuestion = (isQuestionPrefix || /\?$/.test(instruction)) && !isImperativeEdit;
-  const isGreeting = /^(hi|hello|hey|thanks|thank you)\b/i.test(instruction) && instruction.split(/\s+/).length <= 4;
-  const wantsAnswer = (isConversationalQuestion || isGreeting);
-
   const bridgeSocket = state.bridgeSocket;
   if (!bridgeSocket || bridgeSocket.readyState !== WebSocket.OPEN) {
     setAgentStatus(
@@ -1307,12 +1301,10 @@ export async function handleSend(event: MouseEvent) {
     return;
   }
 
-  if (!wantsAnswer) {
-    const ownershipGranted = await acquireOwnership(selectedElement);
-    if (!ownershipGranted) return;
-  }
+  const ownershipGranted = await acquireOwnership(selectedElement);
+  if (!ownershipGranted) return;
 
-  if (!wantsAnswer && state.collabSocket?.connected && state.collabJoined) {
+  if (state.collabSocket?.connected && state.collabJoined) {
     collabEmit("collab:action", {
       sessionId: state.collabProjectId,
       status: "preparing",
@@ -1363,28 +1355,22 @@ export async function handleSend(event: MouseEvent) {
     Array.from(selectedElement.attributes).map((attr) => [attr.name, attr.value])
   );
   const needsVisualContext = /\b(look|visual|appearance|color|colour|background|image|icon|spacing|layout|position|align|responsive|style|restyle|font|size)\b/i.test(instruction);
-  // Conversational questions do not need an element screenshot. Keep the
-  // answer path light; visual context remains available for actual edits or
-  // explicit visual questions through the demand-driven browser tool.
-  const screenshots = wantsAnswer
-    ? undefined
-    : needsVisualContext
-      ? await captureElementScreenshot(selectedElement)
-      : await screenshotPromise;
+  const screenshots = needsVisualContext
+    ? await captureElementScreenshot(selectedElement)
+    : await screenshotPromise;
 
   if (bridgeSocket.readyState !== WebSocket.OPEN) {
     const message = "The Lasso agent bridge disconnected before the task could start.";
     updateAgentTask(task.id, { status: "error", message });
     appendChat("error", message, task.id);
-    if (!wantsAnswer) releaseHeldLock(elementKey(selectedElement));
+    releaseHeldLock(elementKey(selectedElement));
     return;
   }
 
   bridgeSocket.send(
     JSON.stringify({
-      type: wantsAnswer ? "ask" : "edit",
+      type: "edit",
       taskId: task.id,
-      question: wantsAnswer ? instruction : undefined,
       instruction,
       messages,
       changesHistory,

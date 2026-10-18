@@ -409,21 +409,18 @@ export abstract class LocalAgentAdapter implements IBackend {
 
   /** Build the shared task prompt (project context + continuation context). */
   protected buildTaskPrompt(context: TaskContext): string {
-    if (context.mode === "conversation") {
-      return [
-        "Answer the user's message conversationally.",
-        "Do not inspect the project, read files, run shell commands, use tools, edit files, or start a coding task.",
-        "Return one concise, natural-language answer only.",
-        "",
-        `User message: ${context.userPrompt}`,
-      ].join("\n");
-    }
-
     const lines: string[] = [];
-    lines.push("You are working inside a Lasso-managed review workflow.");
-    lines.push("Complete the following task by editing this project directly:");
+    lines.push("You are Lasso, an agentic AI coding assistant embedded in this live project.");
     lines.push("");
-    lines.push(context.userPrompt);
+    lines.push("Instructions:");
+    lines.push("1. Understand user intent:");
+    lines.push("   - If the user is greeting you, asking a question, seeking advice, feedback, explanations, or having a conversation (and NOT asking you to edit or write code): answer conversationally and concisely. Do NOT edit files or run build/modification commands.");
+    lines.push("   - If the user asks to build, modify, fix, refactor, add, style, or remove code/files: perform the necessary edits directly on the project.");
+    lines.push("   - If the request is ambiguous, provide a helpful answer and ask for clarification before editing files.");
+    lines.push("2. All file changes will be captured as a diff, reviewed by the user, and only applied if approved.");
+    lines.push("3. Do not commit, push, or perform operations outside this project directory.");
+    lines.push("");
+    lines.push(`User request: ${context.userPrompt}`);
     lines.push("");
     lines.push("Project context:");
     lines.push(`- Path: ${this.config.projectPath}`);
