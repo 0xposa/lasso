@@ -48,6 +48,14 @@ export type BridgeMessage =
 
 type ModelOption = { id: string; label: string; provider: Provider; locked?: boolean; lockedReason?: string };
 
+function isConversationalPrompt(prompt: string): boolean {
+  const value = prompt.trim().toLowerCase().replace(/[!?.,;:]+$/, "");
+  if (/^(hi|hello|hey|heya|howdy|sup|yo|good morning|good afternoon|good evening|thanks|thank you|thx|ty|what can you do|what can i ask you|who are you|how do you work|how does this work)$/.test(value)) return true;
+  if (/^(what can you do|what can i ask|who are you|how do you work|how does this work)\b/.test(value)) return true;
+  if (/^(what is|what's|how do i|why does|can you explain|tell me about)\b/.test(value)) return true;
+  return false;
+}
+
 function cleanConversationReply(value: unknown): string {
   const text = typeof value === "string" ? value.trim() : "";
   if (!text) return "";
@@ -649,7 +657,7 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
     taskControllers.set(taskId, controller);
 
     const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
-    if (message.type === "ask" && !isLocalAgent) {
+    if ((message.type === "ask" || isConversationalPrompt(instruction)) && !isLocalAgent) {
       await handleHostedConversation(taskId, instruction, model, provider, messages, socket, controller.signal);
       return;
     }
@@ -993,6 +1001,10 @@ export async function startBridge(cwd = process.cwd(), collabConfig: CollabConfi
 
     try {
       const isLocalAgent = ["claude_code", "opencode", "codex_cli", "cursor"].includes(provider || "");
+      if (isConversationalPrompt(prompt) && !isLocalAgent) {
+        await handleHostedConversation(taskId, prompt, model, provider, message.messages, socket, controller.signal);
+        return;
+      }
       const backendModelId = modelIdForBackend(model || "", provider || "");
       
       const sessionInput: RuntimeSessionInput = {
