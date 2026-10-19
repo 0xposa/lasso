@@ -54,7 +54,14 @@ This installs the **Lasso Agent Skill** directly into your Antigravity environme
 
 ## 🚀 How to Use
 
-### 1. Launch from Antigravity
+### 1. Navigate to Your Project or Game
+Go to your project directory (for example `~/game`, or any web app / HTML frontend):
+
+```bash
+cd ~/game
+```
+
+### 2. Launch with `/lasso-agent`
 Inside your Antigravity CLI session (`agy`), type:
 
 ```text
@@ -62,20 +69,19 @@ Inside your Antigravity CLI session (`agy`), type:
 ```
 
 Antigravity will automatically:
-* Start the local dashboard daemon on **`http://127.0.0.1:8080`** (with automatic collision fallback).
-* Connect directly to your active Antigravity session and multi-turn context memory.
-* Provide an interactive link to open the dashboard.
+* **Serve Your App Live**: Launches the active project (e.g. `~/game`) on **`http://127.0.0.1:8080`**.
+* **Inject the Lasso Visual Overlay**: Floats the Lasso toolbar and inspector directly on top of your running game or web app!
+* **Connect to Active Antigravity Session**: Maintains multi-turn memory and project context across edits.
+* **Enable Live Reload**: Reloads your running game/app automatically whenever you approve an AI change.
 
-### 2. Open the Web Dashboard
-Open your browser (e.g. Chrome on Android or desktop) and visit:  
+### 3. Open in Browser
+Open your browser and visit:  
 👉 **`http://127.0.0.1:8080`**
 
-### 3. Dashboard Features
-* 🎯 **Command Bar (⌘K / Prompt Input)**: Describe any feature, bug fix, or refactor.
-* ⚡ **Live Antigravity Streaming**: Stream reasoning and tool calls (*write_to_file*, *replace_file_content*, *run_command*) in real time.
-* 🧠 **Native Model Picker**: Toggle between Gemini 3.8 Flash (High), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6, etc.
-* 🔍 **Review & Diff Panel**: Verify source code diffs with one-click **Accept** or **Revert**.
-* 🌐 **Live App Preview**: Embed your running local application (e.g. Vite on `3000` or Next.js) with Lasso visual selection.
+You will see your game/app running live, with the Lasso Agent toolbar floating over the screen:
+* 🎯 **Click & Lasso Selection**: Click any button, HUD element, or canvas area in your game to edit it.
+* ⚡ **Command Bar (⌘K / Ctrl+K)**: Press shortcut anywhere to open the inline Antigravity prompt bar.
+* 🔍 **Review & Diff Preview**: View before/after diffs and click **✓ Accept** to auto-reload with the new code.
 
 ---
 

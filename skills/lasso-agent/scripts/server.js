@@ -1,27 +1,32 @@
 #!/data/data/com.termux/files/usr/bin/node
 /**
- * Lasso Agent - Web Interface & Antigravity Bridge Server
- * Runs on 127.0.0.1:8080 (or next free port)
+ * Lasso Agent — Antigravity-Powered Visual Development Server & Bridge
+ *
+ * Runs the user's project (game, static site, or app) on localhost (default 8080),
+ * automatically injects the Lasso Visual Overlay into the running app,
+ * and bridges all visual selections, ⌘K prompts, and tasks directly to
+ * Google Antigravity (agy) while preserving multi-turn session memory.
  */
 
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawn, execSync, exec } = require("node:child_process");
+const { spawn, execSync } = require("node:child_process");
+
+// Use local ws module
+const { WebSocketServer, WebSocket } = require(path.join(__dirname, "node_modules", "ws"));
 
 const DEFAULT_PORT = parseInt(process.env.LASSO_AGENT_PORT || "8080", 10);
 const PID_DIR = path.join(process.env.HOME || "", ".lasso");
 const PID_FILE = path.join(PID_DIR, "lasso-agent.pid");
 const STATE_FILE = path.join(PID_DIR, "lasso-agent-session.json");
+const OVERLAY_FILE = path.join(__dirname, "..", "assets", "overlay.js");
 
-// Ensure .lasso dir
 try { fs.mkdirSync(PID_DIR, { recursive: true }); } catch (_) {}
 
-// Active state
 let activeProjectDir = process.env.LASSO_PROJECT_DIR || process.cwd();
 let activeConversationId = process.env.ANTIGRAVITY_CONVERSATION_ID || loadSavedConversationId() || "";
 let activeModel = "gemini-3.8-flash-high";
-let isRunningTask = false;
 
 function loadSavedConversationId() {
   try {
@@ -34,6 +39,7 @@ function loadSavedConversationId() {
 }
 
 function saveConversationId(id) {
+  if (!id) return;
   activeConversationId = id;
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify({
@@ -44,6 +50,32 @@ function saveConversationId(id) {
   } catch (_) {}
 }
 
+// MIME types dictionary for game and web assets
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".htm": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".mjs": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".webp": "image/webp",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".otf": "font/otf",
+  ".txt": "text/plain; charset=utf-8",
+};
+
+// Available Antigravity models
 let cachedModels = null;
 function getAvailableModels() {
   if (cachedModels && cachedModels.length > 0) return cachedModels;
@@ -56,9 +88,9 @@ function getAvailableModels() {
       if (!trimmed || trimmed.startsWith("Fetching") || trimmed.includes("...")) continue;
       const parts = trimmed.split(/[\t]+|\s{2,}/);
       if (parts.length >= 2) {
-        models.push({ id: parts[0].trim(), label: parts[1].trim() });
+        models.push({ id: parts[0].trim(), label: parts[1].trim(), provider: "antigravity" });
       } else if (parts[0].trim()) {
-        models.push({ id: parts[0].trim(), label: parts[0].trim() });
+        models.push({ id: parts[0].trim(), label: parts[0].trim(), provider: "antigravity" });
       }
     }
     if (models.length > 0) {
@@ -67,629 +99,259 @@ function getAvailableModels() {
     }
   } catch (_) {}
   cachedModels = [
-    { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" },
-    { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)" },
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)" },
-    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)" },
-    { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)" }
+    { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)", provider: "google" },
+    { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium)", provider: "google" },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Thinking)", provider: "anthropic" },
+    { id: "claude-opus-4-6-thinking", label: "Claude Opus 4.6 (Thinking)", provider: "anthropic" },
+    { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", provider: "openai" }
   ];
   return cachedModels;
 }
 
-// Git helpers
-function getGitStatus(cwd) {
-  try {
-    const status = execSync("git status --short 2>/dev/null", { cwd, encoding: "utf8" });
-    const diff = execSync("git diff 2>/dev/null", { cwd, encoding: "utf8" });
-    return {
-      isRepo: true,
-      hasChanges: Boolean(status.trim()),
-      statusLines: status.split("\n").filter(Boolean),
-      diff: diff.slice(0, 10000) // cap size
-    };
-  } catch (_) {
-    return { isRepo: false, hasChanges: false, statusLines: [], diff: "" };
+// In-memory snapshots for safe Undo
+const taskSnapshots = new Map();
+
+function snapshotFiles(dir, files) {
+  const snaps = [];
+  for (const rel of files) {
+    const full = path.join(dir, rel);
+    try {
+      if (fs.existsSync(full)) {
+        snaps.push({ file: rel, content: fs.readFileSync(full, "utf8") });
+      } else {
+        snaps.push({ file: rel, content: null });
+      }
+    } catch (_) {}
+  }
+  return snaps;
+}
+
+function restoreFiles(dir, snaps) {
+  for (const s of snaps) {
+    const full = path.join(dir, s.file);
+    try {
+      if (s.content === null) {
+        if (fs.existsSync(full)) fs.unlinkSync(full);
+      } else {
+        fs.mkdirSync(path.dirname(full), { recursive: true });
+        fs.writeFileSync(full, s.content, "utf8");
+      }
+    } catch (_) {}
   }
 }
 
-// HTML UI
-function renderHtml() {
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lasso Agent — Visual Code Editor</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #0b0f19;
-      --card: #111827;
-      --card-border: #1f2937;
-      --accent: #6366f1;
-      --accent-hover: #4f46e5;
-      --accent-glow: rgba(99, 102, 241, 0.25);
-      --text: #f3f4f6;
-      --text-muted: #9ca3af;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --danger: #ef4444;
+// Live reload SSE clients
+const reloadClients = new Set();
+function triggerReload() {
+  for (const client of reloadClients) {
+    try {
+      client.write("data: reload\n\n");
+    } catch (_) {
+      reloadClients.delete(client);
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Plus Jakarta Sans', -apple-system, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-    }
-    header {
-      background: rgba(17, 24, 39, 0.85);
-      backdrop-filter: blur(12px);
-      border-bottom: 1px solid var(--card-border);
-      padding: 12px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      position: sticky;
-      top: 0;
-      z-index: 50;
-    }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-weight: 700;
-      font-size: 1.15rem;
-      letter-spacing: -0.02em;
-    }
-    .brand-badge {
-      font-size: 0.7rem;
-      background: var(--accent-glow);
-      color: #818cf8;
-      border: 1px solid #4338ca;
-      padding: 2px 8px;
-      border-radius: 9999px;
-      font-weight: 600;
-      text-transform: uppercase;
-    }
-    .status-bar {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      font-size: 0.85rem;
-    }
-    .status-pill {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: #1f2937;
-      padding: 4px 10px;
-      border-radius: 6px;
-      color: var(--text-muted);
-    }
-    .dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--success);
-      box-shadow: 0 0 8px var(--success);
-    }
-    .main-container {
-      display: grid;
-      grid-template-columns: 320px 1fr;
-      flex: 1;
-      height: calc(100vh - 61px);
-    }
-    @media (max-width: 860px) {
-      .main-container { grid-template-columns: 1fr; height: auto; }
-    }
-    aside {
-      background: var(--card);
-      border-right: 1px solid var(--card-border);
-      padding: 20px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-      overflow-y: auto;
-    }
-    .section-title {
-      font-size: 0.75rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--text-muted);
-      font-weight: 700;
-      margin-bottom: 8px;
-    }
-    .select-box, input[type="text"] {
-      width: 100%;
-      background: #1f2937;
-      border: 1px solid #374151;
-      color: var(--text);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-size: 0.85rem;
-      outline: none;
-      transition: border 0.15s;
-    }
-    .select-box:focus, input[type="text"]:focus {
-      border-color: var(--accent);
-    }
-    .btn {
-      background: var(--accent);
-      color: white;
-      border: none;
-      padding: 9px 14px;
-      border-radius: 6px;
-      font-weight: 600;
-      font-size: 0.85rem;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      transition: background 0.15s, transform 0.1s;
-    }
-    .btn:hover { background: var(--accent-hover); }
-    .btn:active { transform: scale(0.98); }
-    .btn-secondary {
-      background: #1f2937;
-      color: var(--text);
-      border: 1px solid #374151;
-    }
-    .btn-secondary:hover { background: #374151; }
-    .btn-danger { background: #991b1b; }
-    .btn-danger:hover { background: #b91c1c; }
-    .btn-success { background: #065f46; }
-    .btn-success:hover { background: #047857; }
-    
-    .workspace-area {
-      display: flex;
-      flex-direction: column;
-      background: var(--bg);
-      overflow: hidden;
-    }
-    .prompt-container {
-      background: var(--card);
-      border-bottom: 1px solid var(--card-border);
-      padding: 16px 24px;
-    }
-    .prompt-box {
-      display: flex;
-      gap: 12px;
-      position: relative;
-    }
-    .prompt-box textarea {
-      flex: 1;
-      background: #0b0f19;
-      border: 1px solid #374151;
-      border-radius: 8px;
-      color: var(--text);
-      padding: 12px 16px;
-      font-size: 0.95rem;
-      font-family: inherit;
-      resize: vertical;
-      min-height: 70px;
-      max-height: 250px;
-      outline: none;
-      transition: border 0.2s, box-shadow 0.2s;
-    }
-    .prompt-box textarea:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 3px var(--accent-glow);
-    }
-    .prompt-actions {
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-end;
-      gap: 8px;
-    }
-    .content-area {
-      flex: 1;
-      overflow-y: auto;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 16px;
-    }
-    .stream-feed {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.85rem;
-      background: #030712;
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      padding: 16px;
-      min-height: 140px;
-      max-height: 300px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-      color: #d1d5db;
-    }
-    .feed-tag {
-      color: #818cf8;
-      font-weight: 600;
-    }
-    .diff-viewer {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 0.82rem;
-      background: #030712;
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      padding: 14px;
-      overflow-x: auto;
-      max-height: 280px;
-      color: #e5e7eb;
-      white-space: pre-wrap;
-    }
-    .diff-add { color: #34d399; background: rgba(52, 211, 153, 0.1); }
-    .diff-del { color: #f87171; background: rgba(248, 113, 113, 0.1); }
-    .app-preview-frame {
-      width: 100%;
-      height: 380px;
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      background: #ffffff;
-    }
-  </style>
-</head>
-<body>
-
-  <header>
-    <div class="brand">
-      <span>🎯 Lasso Agent</span>
-      <span class="brand-badge">Antigravity Native</span>
-    </div>
-    <div class="status-bar">
-      <div class="status-pill">
-        <span class="dot" id="statusDot"></span>
-        <span id="sessionStatus">Connected to Antigravity</span>
-      </div>
-      <button class="btn btn-secondary" onclick="resetSession()" title="Start a clean session with new memory">🔄 New Session</button>
-    </div>
-  </header>
-
-  <div class="main-container">
-    <aside>
-      <div>
-        <div class="section-title">Antigravity AI Model</div>
-        <select class="select-box" id="modelSelect" onchange="updateModel()">
-          <option value="gemini-3.8-flash-high">Gemini 3.8 Flash (High)</option>
-          <option value="gemini-3.8-flash-medium">Gemini 3.8 Flash (Medium)</option>
-          <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (Thinking)</option>
-          <option value="claude-opus-4-6-thinking">Claude Opus 4.6 (Thinking)</option>
-          <option value="gpt-oss-120b-medium">GPT-OSS 120B (Medium)</option>
-        </select>
-      </div>
-
-      <div>
-        <div class="section-title">Project Directory</div>
-        <div style="font-size: 0.8rem; font-family: 'JetBrains Mono', monospace; word-break: break-all; color: #9ca3af; background: #030712; padding: 8px; border-radius: 6px;" id="projectPath">
-          ...
-        </div>
-      </div>
-
-      <div>
-        <div class="section-title">Session Context Memory</div>
-        <div style="font-size: 0.78rem; color: #9ca3af; margin-bottom: 8px;" id="memoryInfo">
-          Multi-turn memory preserves your project architecture and previous edits.
-        </div>
-        <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: #6ee7b7; background: #064e3b33; padding: 6px; border-radius: 4px; word-break: break-all;" id="convId">
-          Session ID: Initializing...
-        </div>
-      </div>
-
-      <div>
-        <div class="section-title">Live App Preview (URL)</div>
-        <div style="display: flex; gap: 6px;">
-          <input type="text" id="previewUrl" value="http://localhost:3000" placeholder="http://localhost:3000">
-          <button class="btn btn-secondary" onclick="loadPreview()">Load</button>
-        </div>
-      </div>
-    </aside>
-
-    <main class="workspace-area">
-      <div class="prompt-container">
-        <div class="prompt-box">
-          <textarea id="promptInput" placeholder="What would you like Lasso Agent to build or change? (e.g. 'Add a responsive hero section with a dark mode toggle')"></textarea>
-          <div class="prompt-actions">
-            <button class="btn" id="sendBtn" onclick="sendPrompt()">🚀 Execute Task</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="content-area">
-        <!-- Live Action Stream -->
-        <div class="card">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <div class="section-title" style="margin-bottom: 0;">⚡ Antigravity Live Stream & Reasoning</div>
-            <span id="taskSpinner" style="font-size: 0.8rem; color: var(--accent); display: none;">⏳ Working...</span>
-          </div>
-          <div class="stream-feed" id="streamFeed">Ready for instructions. Type a task above and click Execute.</div>
-        </div>
-
-        <!-- Diff Review Panel -->
-        <div class="card" id="diffCard" style="display: none;">
-          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <div class="section-title" style="margin-bottom: 0;">🔍 Review Changes (Workspace Guard)</div>
-            <div style="display: flex; gap: 8px;">
-              <button class="btn btn-success" onclick="acceptChanges()">✓ Accept Changes</button>
-              <button class="btn btn-danger" onclick="rejectChanges()">✗ Revert / Undo</button>
-            </div>
-          </div>
-          <div class="diff-viewer" id="diffViewer">No changes to review.</div>
-        </div>
-
-        <!-- Embedded App Preview -->
-        <div class="card" id="previewCard" style="display: none;">
-          <div class="section-title">Visual App Canvas</div>
-          <iframe id="appIframe" class="app-preview-frame" src="about:blank"></iframe>
-        </div>
-      </div>
-    </main>
-  </div>
-
-  <script>
-    let activeConversationId = "";
-
-    async function loadStatus() {
-      try {
-        const res = await fetch('/api/status');
-        const data = await res.json();
-        document.getElementById('projectPath').textContent = data.cwd || 'N/A';
-        activeConversationId = data.conversationId || '';
-        document.getElementById('convId').textContent = activeConversationId ? 'ID: ' + activeConversationId : 'ID: Ready (New Session)';
-        if (data.models && data.models.length > 0) {
-          const select = document.getElementById('modelSelect');
-          select.innerHTML = '';
-          data.models.forEach(m => {
-            const opt = document.createElement('option');
-            opt.value = m.id;
-            opt.textContent = m.label;
-            if (m.id === data.activeModel) opt.selected = true;
-            select.appendChild(opt);
-          });
-        }
-        checkDiff();
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    async function sendPrompt() {
-      const prompt = document.getElementById('promptInput').value.trim();
-      if (!prompt) return;
-
-      const model = document.getElementById('modelSelect').value;
-      const sendBtn = document.getElementById('sendBtn');
-      const spinner = document.getElementById('taskSpinner');
-      const feed = document.getElementById('streamFeed');
-
-      sendBtn.disabled = true;
-      spinner.style.display = 'inline';
-      feed.textContent = '[Antigravity] Starting execution...\\n';
-
-      try {
-        const res = await fetch('/api/prompt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ prompt, model, conversationId: activeConversationId })
-        });
-
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const data = JSON.parse(line);
-              if (data.type === 'progress') {
-                feed.textContent += data.message;
-                feed.scrollTop = feed.scrollHeight;
-              } else if (data.type === 'tool_start') {
-                feed.textContent += '\\n[Tool] ' + data.name + (data.detail ? ': ' + data.detail : '') + '\\n';
-                feed.scrollTop = feed.scrollHeight;
-              } else if (data.type === 'tool_done') {
-                feed.textContent += '[Tool] ' + data.name + ' completed ✓\\n';
-                feed.scrollTop = feed.scrollHeight;
-              } else if (data.type === 'session_init') {
-                activeConversationId = data.conversationId;
-                document.getElementById('convId').textContent = 'ID: ' + activeConversationId;
-              } else if (data.type === 'result') {
-                feed.textContent += '\\n\\n=== Finished ===\\n' + (data.response || 'Success') + '\\n';
-                feed.scrollTop = feed.scrollHeight;
-              } else if (data.type === 'error') {
-                feed.textContent += '\\n[Error] ' + data.message + '\\n';
-              }
-            } catch (_) {}
-          }
-        }
-      } catch (err) {
-        feed.textContent += '\\n[Request Error] ' + err.message;
-      } finally {
-        sendBtn.disabled = false;
-        spinner.style.display = 'none';
-        checkDiff();
-      }
-    }
-
-    async function checkDiff() {
-      try {
-        const res = await fetch('/api/diff');
-        const data = await res.json();
-        const diffCard = document.getElementById('diffCard');
-        const diffViewer = document.getElementById('diffViewer');
-
-        if (data.hasChanges && data.diff) {
-          diffCard.style.display = 'block';
-          diffViewer.textContent = data.diff;
-        } else {
-          diffCard.style.display = 'none';
-        }
-      } catch (_) {}
-    }
-
-    async function acceptChanges() {
-      if (!confirm('Accept and commit these changes?')) return;
-      await fetch('/api/accept', { method: 'POST' });
-      checkDiff();
-      alert('Changes accepted and committed!');
-    }
-
-    async function rejectChanges() {
-      if (!confirm('Are you sure you want to revert all changes?')) return;
-      await fetch('/api/reject', { method: 'POST' });
-      checkDiff();
-      alert('Changes reverted to original state.');
-    }
-
-    async function resetSession() {
-      if (!confirm('Start a new session? This clears context memory.')) return;
-      await fetch('/api/reset-session', { method: 'POST' });
-      activeConversationId = '';
-      document.getElementById('convId').textContent = 'ID: Ready (New Session)';
-      document.getElementById('streamFeed').textContent = 'Session reset. Context memory cleared.';
-    }
-
-    function loadPreview() {
-      const url = document.getElementById('previewUrl').value.trim();
-      if (!url) return;
-      document.getElementById('previewCard').style.display = 'block';
-      document.getElementById('appIframe').src = url;
-    }
-
-    loadStatus();
-  </script>
-</body>
-</html>`;
+  }
 }
 
-// Request handler
+// Create HTTP server
 function createServer() {
-  const server = http.createServer(async (req, res) => {
-    const url = req.url ? req.url.split("?")[0] : "/";
+  const server = http.createServer((req, res) => {
+    const rawUrl = req.url || "/";
+    const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
+    let pathname = decodeURIComponent(parsedUrl.pathname);
 
-    // CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(200);
-      res.end();
+    // Live reload SSE endpoint
+    if (pathname === "/__lasso/reload-events") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive"
+      });
+      reloadClients.add(res);
+      req.on("close", () => reloadClients.delete(res));
       return;
     }
 
-    // Serve UI
-    if (url === "/" || url === "/index.html") {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(renderHtml());
+    // Serve Lasso Overlay Bundle
+    if (pathname === "/__lasso/overlay.js") {
+      if (fs.existsSync(OVERLAY_FILE)) {
+        res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+        res.end(fs.readFileSync(OVERLAY_FILE));
+      } else {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Lasso overlay bundle not found.");
+      }
       return;
     }
 
-    // Status API
-    if (url === "/api/status" && req.method === "GET") {
+    // Status endpoint for health checks
+    if (pathname === "/__lasso/status") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        status: "running",
-        cwd: activeProjectDir,
+        ok: true,
+        projectDir: activeProjectDir,
         conversationId: activeConversationId,
-        activeModel,
-        models: getAvailableModels(),
+        model: activeModel,
       }));
       return;
     }
 
-    // Reset Session
-    if (url === "/api/reset-session" && req.method === "POST") {
-      saveConversationId("");
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, conversationId: "" }));
-      return;
+    // Resolve static file from activeProjectDir (e.g. ~/game)
+    let filePath = path.join(activeProjectDir, pathname);
+
+    // If directory, check index.html
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+      filePath = path.join(filePath, "index.html");
     }
 
-    // Git Diff
-    if (url === "/api/diff" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(getGitStatus(activeProjectDir)));
-      return;
-    }
-
-    // Accept Changes
-    if (url === "/api/accept" && req.method === "POST") {
-      try {
-        execSync('git add -A && git commit -m "Applied changes via Lasso Agent"', { cwd: activeProjectDir });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (err) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
+    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      // Fallback: check index.html in project root
+      const fallbackIndex = path.join(activeProjectDir, "index.html");
+      if (fs.existsSync(fallbackIndex)) {
+        filePath = fallbackIndex;
+      } else {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end(`File not found: ${pathname} in ${activeProjectDir}`);
+        return;
       }
-      return;
     }
 
-    // Reject Changes
-    if (url === "/api/reject" && req.method === "POST") {
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] || "application/octet-stream";
+
+    // If HTML: inject the Lasso Overlay & Live Reload script!
+    if (ext === ".html" || ext === ".htm") {
       try {
-        execSync("git checkout -- . && git clean -fd", { cwd: activeProjectDir });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (err) {
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-      return;
-    }
+        let html = fs.readFileSync(filePath, "utf8");
+        const port = server.address() ? server.address().port : DEFAULT_PORT;
+        
+        const injection = `
+<!-- [Lasso Agent] Overlay & Live Reload Injection -->
+<script src="/__lasso/overlay.js?bridgePort=${port}"></script>
+<script>
+  (function() {
+    try {
+      var es = new EventSource('/__lasso/reload-events');
+      es.onmessage = function(e) {
+        if (e.data === 'reload') {
+          console.log('[lasso] Reloading page to show code changes...');
+          window.location.reload();
+        }
+      };
+    } catch(err) {}
+  })();
+</script>
+`;
 
-    // Prompt Execution via Antigravity
-    if (url === "/api/prompt" && req.method === "POST") {
-      let body = "";
-      req.on("data", chunk => { body += chunk; });
-      req.on("end", () => {
-        let payload = {};
-        try { payload = JSON.parse(body); } catch (_) {}
-
-        const prompt = payload.prompt || "";
-        const model = payload.model || activeModel;
-        const convId = payload.conversationId || activeConversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || "";
-
-        if (!prompt) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Prompt is required" }));
-          return;
+        if (html.includes("</head>")) {
+          html = html.replace("</head>", `${injection}</head>`);
+        } else if (html.includes("</body>")) {
+          html = html.replace("</body>", `${injection}</body>`);
+        } else {
+          html += injection;
         }
 
-        res.writeHead(200, {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Transfer-Encoding": "chunked",
-          "Cache-Control": "no-cache",
-        });
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+        return;
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Failed to read HTML: " + err.message);
+        return;
+      }
+    }
 
-        // Launch agy
+    // Serve other static assets (images, audio, js, css, etc.)
+    try {
+      const stream = fs.createReadStream(filePath);
+      res.writeHead(200, { "Content-Type": contentType });
+      stream.pipe(res);
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Stream error: " + err.message);
+    }
+  });
+
+  // Attach WebSocket Bridge to the same HTTP server
+  const wss = new WebSocketServer({ server });
+
+  wss.on("connection", (ws) => {
+    // Send configuration to overlay on connection
+    const models = getAvailableModels().map(m => ({
+      id: m.id,
+      label: m.label,
+      provider: m.provider || "antigravity",
+      locked: false,
+    }));
+
+    ws.send(JSON.stringify({
+      type: "config",
+      apiKeyConfigured: true,
+      agentConfigured: true,
+      models,
+      collab: null,
+      user: { name: "Lasso Developer", email: "antigravity@local" }
+    }));
+
+    ws.on("message", async (data) => {
+      let msg = {};
+      try {
+        msg = JSON.parse(data.toString("utf8"));
+      } catch (_) {
+        return;
+      }
+
+      if (msg.type === "hello") {
+        ws.send(JSON.stringify({
+          type: "config",
+          apiKeyConfigured: true,
+          agentConfigured: true,
+          models,
+          collab: null,
+        }));
+        return;
+      }
+
+      // Handle Task / Prompt / Edit request
+      if (msg.type === "edit" || msg.type === "oneshot" || msg.type === "ask") {
+        const taskId = msg.taskId || `task-${Date.now()}`;
+        const instruction = msg.instruction || msg.prompt || "";
+        const model = msg.model || activeModel;
+
+        if (!instruction.trim()) return;
+
+        ws.send(JSON.stringify({
+          type: "agent_status",
+          taskId,
+          status: "thinking",
+          message: "Antigravity is reasoning on " + path.basename(activeProjectDir) + "...",
+        }));
+
+        // Take pre-edit snapshot of all project files
+        const projectFiles = [];
+        try {
+          const files = fs.readdirSync(activeProjectDir);
+          for (const f of files) {
+            if (!f.startsWith(".") && f !== "node_modules") projectFiles.push(f);
+          }
+        } catch (_) {}
+        const beforeSnaps = snapshotFiles(activeProjectDir, projectFiles);
+        taskSnapshots.set(taskId, beforeSnaps);
+
+        // Prepare Antigravity prompt with element / project context
+        let fullPrompt = instruction;
+        if (msg.element) {
+          fullPrompt += `\n\nTarget Element: <${msg.element.tag}> ${msg.element.label || ""}\nSource Hint: ${msg.element.sourceHint || ""}`;
+        }
+        fullPrompt += `\n\nImportant: You are modifying files directly in ${activeProjectDir}. Please edit the necessary files cleanly to achieve the desired result.`;
+
         const args = [
-          "-p", prompt,
+          "-p", fullPrompt,
           "--output-format", "stream-json",
           "--mode", "accept-edits",
           "--dangerously-skip-permissions"
         ];
         if (model) args.push("--model", model);
-        if (convId) args.push("--conversation", convId);
+        if (activeConversationId) args.push("--conversation", activeConversationId);
 
         const child = spawn("agy", args, {
           cwd: activeProjectDir,
@@ -698,7 +360,7 @@ function createServer() {
 
         let stdoutBuffer = "";
 
-        child.stdout.on("data", chunk => {
+        child.stdout.on("data", (chunk) => {
           stdoutBuffer += chunk.toString("utf8");
           const lines = stdoutBuffer.split("\n");
           stdoutBuffer = lines.pop() || "";
@@ -712,65 +374,104 @@ function createServer() {
                 saveConversationId(event.conversation_id);
               }
 
-              if (event.event === "init") {
-                res.write(JSON.stringify({ type: "session_init", conversationId: event.conversation_id }) + "\n");
-              } else if (event.event === "step_update") {
+              if (event.event === "step_update") {
                 const step = event.step_update;
                 if (step?.step_type === "agent_response" && step.text_delta) {
-                  res.write(JSON.stringify({ type: "progress", message: step.text_delta }) + "\n");
+                  ws.send(JSON.stringify({
+                    type: "agent_status",
+                    taskId,
+                    status: "thinking",
+                    message: step.text_delta.slice(0, 150),
+                  }));
                 } else if (step?.step_type === "tool") {
-                  if (step.state === "ACTIVE") {
-                    res.write(JSON.stringify({
-                      type: "tool_start",
-                      name: step.tool_name || "tool",
-                      detail: step.tool_info?.parameters?.CommandLine || step.tool_info?.parameters?.TargetFile || ""
-                    }) + "\n");
-                  } else if (step.state === "DONE") {
-                    res.write(JSON.stringify({ type: "tool_done", name: step.tool_name || "tool" }) + "\n");
-                  }
+                  const toolName = step.tool_name || "tool";
+                  ws.send(JSON.stringify({
+                    type: "agent_status",
+                    taskId,
+                    status: "working",
+                    message: `Executing ${toolName}...`,
+                  }));
                 }
-              } else if (event.event === "result") {
-                const r = event.result;
-                if (r?.conversation_id) saveConversationId(r.conversation_id);
-                res.write(JSON.stringify({
-                  type: "result",
-                  status: r?.status,
-                  response: r?.response
-                }) + "\n");
               }
             } catch (_) {}
           }
         });
 
-        child.stderr.on("data", chunk => {
-          const text = chunk.toString("utf8");
-          if (text.includes("error") || text.includes("Error")) {
-            res.write(JSON.stringify({ type: "error", message: text.slice(0, 300) }) + "\n");
+        child.on("close", () => {
+          // Detect changes by comparing before and after files
+          const afterSnaps = snapshotFiles(activeProjectDir, projectFiles);
+          const changes = [];
+
+          for (const after of afterSnaps) {
+            const before = beforeSnaps.find(b => b.file === after.file);
+            if (!before || before.content !== after.content) {
+              changes.push({
+                filePath: after.file,
+                oldString: before?.content || "",
+                newString: after.content || "",
+                operation: !before ? "created" : "modified",
+              });
+            }
+          }
+
+          if (changes.length > 0) {
+            // Send review payload to overlay
+            ws.send(JSON.stringify({
+              type: "agent_status",
+              taskId,
+              status: "review",
+              message: "Review proposed changes",
+              changes,
+            }));
+          } else {
+            ws.send(JSON.stringify({
+              type: "applied",
+              taskId,
+              message: "Task completed.",
+            }));
+            triggerReload();
           }
         });
 
-        child.on("close", code => {
-          if (stdoutBuffer.trim().startsWith("{")) {
-            try {
-              const event = JSON.parse(stdoutBuffer.trim());
-              if (event.event === "result") {
-                res.write(JSON.stringify({ type: "result", status: event.result?.status, response: event.result?.response }) + "\n");
-              }
-            } catch (_) {}
-          }
-          res.end();
+        child.on("error", (err) => {
+          ws.send(JSON.stringify({
+            type: "agent_status",
+            taskId,
+            status: "error",
+            message: "Failed to invoke Antigravity: " + err.message,
+          }));
         });
+      }
 
-        child.on("error", err => {
-          res.write(JSON.stringify({ type: "error", message: "Failed to spawn agy: " + err.message }) + "\n");
-          res.end();
-        });
-      });
-      return;
-    }
+      // Handle Apply (User clicked Accept)
+      if (msg.type === "apply") {
+        const taskId = msg.taskId;
+        ws.send(JSON.stringify({
+          type: "applied",
+          taskId,
+          message: "Changes applied successfully!",
+        }));
+        // Auto reload game / page in browser!
+        setTimeout(triggerReload, 300);
+      }
 
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not Found");
+      // Handle Undo (User clicked Revert)
+      if (msg.type === "undo") {
+        const taskId = msg.taskId;
+        const snaps = taskSnapshots.get(taskId);
+        if (snaps) {
+          restoreFiles(activeProjectDir, snaps);
+          taskSnapshots.delete(taskId);
+        }
+        ws.send(JSON.stringify({
+          type: "agent_status",
+          taskId,
+          status: "stopped",
+          message: "Changes reverted.",
+        }));
+        setTimeout(triggerReload, 300);
+      }
+    });
   });
 
   return server;
@@ -792,9 +493,9 @@ function startListening(port) {
   server.once("listening", () => {
     const address = server.address();
     const actualPort = typeof address === "object" ? address.port : port;
-    fs.writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: actualPort, startTime: Date.now() }));
-    console.log(`[Lasso Agent] Running on http://127.0.0.1:${actualPort}`);
-    console.log(`[Lasso Agent] Project directory: ${activeProjectDir}`);
+    fs.writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: actualPort, startTime: Date.now(), projectDir: activeProjectDir }));
+    console.log(`[Lasso Agent] Serving project at http://127.0.0.1:${actualPort}`);
+    console.log(`[Lasso Agent] Active Project: ${activeProjectDir}`);
   });
 
   server.listen(port, "127.0.0.1");
