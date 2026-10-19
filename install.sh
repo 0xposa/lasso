@@ -43,23 +43,23 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR/skills/lasso-agent" ]; then
 fi
 
 # 3. Target Skill Directories for Antigravity
-SKILLS_DIR_GLOBAL="$HOME/.gemini/config/skills/lasso-agent"
-SKILLS_DIR_LOCAL="$HOME/.agents/skills/lasso-agent"
-SKILLS_DIR_CLI="$HOME/.gemini/antigravity-cli/skills/lasso-agent"
+for skill in lasso-agent lasso-agent-off; do
+  if [ -d "$SCRIPT_DIR/skills/$skill" ]; then
+    echo -e "📁 Installing $skill to Antigravity directory..."
+    mkdir -p "$HOME/.gemini/config/skills/$skill"
+    cp -r "$SCRIPT_DIR/skills/$skill/"* "$HOME/.gemini/config/skills/$skill/"
 
-echo -e "📁 Installing skill to Antigravity directory..."
-mkdir -p "$SKILLS_DIR_GLOBAL"
-cp -r "$SCRIPT_DIR/skills/lasso-agent/"* "$SKILLS_DIR_GLOBAL/"
+    if [ -d "$HOME/.agents/skills" ]; then
+      mkdir -p "$HOME/.agents/skills/$skill"
+      cp -r "$SCRIPT_DIR/skills/$skill/"* "$HOME/.agents/skills/$skill/"
+    fi
 
-if [ -d "$HOME/.agents/skills" ]; then
-  mkdir -p "$SKILLS_DIR_LOCAL"
-  cp -r "$SCRIPT_DIR/skills/lasso-agent/"* "$SKILLS_DIR_LOCAL/"
-fi
-
-if [ -d "$HOME/.gemini/antigravity-cli/skills" ]; then
-  mkdir -p "$SKILLS_DIR_CLI"
-  cp -r "$SCRIPT_DIR/skills/lasso-agent/"* "$SKILLS_DIR_CLI/"
-fi
+    if [ -d "$HOME/.gemini/antigravity-cli/skills" ]; then
+      mkdir -p "$HOME/.gemini/antigravity-cli/skills/$skill"
+      cp -r "$SCRIPT_DIR/skills/$skill/"* "$HOME/.gemini/antigravity-cli/skills/$skill/"
+    fi
+  fi
+done
 
 # 4. Make scripts executable and fix shebangs for Termux / Linux
 chmod +x "$SKILLS_DIR_GLOBAL/scripts/server.js" "$SKILLS_DIR_GLOBAL/scripts/lasso-ctl.sh" 2>/dev/null || true
@@ -93,8 +93,8 @@ fi
 echo -e "\n\033[1;32m✅ Lasso Agent successfully installed!\033[0m"
 echo -e "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo -e "🎯 \033[1;37mHow to use in Antigravity:\033[0m"
-echo -e "   Type \033[1;33m/lasso-agent\033[0m in your Antigravity chat and press Enter."
-echo -e "   This will launch the local dashboard at \033[1;36mhttp://127.0.0.1:8080\033[0m"
+echo -e "   Type \033[1;33m/lasso-agent\033[0m     - Launch local server & overlay on http://127.0.0.1:8080"
+echo -e "   Type \033[1;33m/lasso-agent-off\033[0m - Shut down the local server completely"
 echo -e ""
 echo -e "💻 \033[1;37mTerminal CLI commands (optional):\033[0m"
 echo -e "   \033[1;36mlasso-agent start\033[0m   - Start server in background"

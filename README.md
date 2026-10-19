@@ -81,7 +81,14 @@ Open your browser and visit:
 You will see your game/app running live, with the Lasso Agent toolbar floating over the screen:
 * 🎯 **Click & Lasso Selection**: Click any button, HUD element, or canvas area in your game to edit it.
 * ⚡ **Command Bar (⌘K / Ctrl+K)**: Press shortcut anywhere to open the inline Antigravity prompt bar.
-* 🔍 **Review & Diff Preview**: View before/after diffs and click **✓ Accept** to auto-reload with the new code.
+### 4. Shut Down with `/lasso-agent-off`
+When you're done developing or want to free up port 8080, simply type in Antigravity:
+
+```text
+/lasso-agent-off
+```
+
+This immediately and cleanly terminates the background local server.
 
 ---
 
