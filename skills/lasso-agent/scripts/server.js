@@ -3,18 +3,21 @@
  * Lasso Agent — Antigravity-Powered Visual Development Server & Bridge
  *
  * Runs the user's project (game, static site, or app) on localhost (default 8080),
- * automatically injects the Lasso Visual Overlay into the running app,
+ * automatically discovers web roots (root, web/, public/, dist/, etc.),
+ * reverse-proxies backend dev servers & WebSockets (e.g. FastAPI, Vite, Express),
+ * injects the Lasso Visual Overlay directly into the live app,
  * and bridges all visual selections, ⌘K prompts, and tasks directly to
  * Google Antigravity (agy) while preserving multi-turn session memory.
  */
 
 const http = require("node:http");
+const net = require("node:net");
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, execSync } = require("node:child_process");
 
 // Use local ws module
-const { WebSocketServer, WebSocket } = require(path.join(__dirname, "node_modules", "ws"));
+const { WebSocketServer } = require(path.join(__dirname, "node_modules", "ws"));
 
 const DEFAULT_PORT = parseInt(process.env.LASSO_AGENT_PORT || "8080", 10);
 const PID_DIR = path.join(process.env.HOME || "", ".lasso");
@@ -27,6 +30,8 @@ try { fs.mkdirSync(PID_DIR, { recursive: true }); } catch (_) {}
 let activeProjectDir = process.env.LASSO_PROJECT_DIR || process.cwd();
 let activeConversationId = process.env.ANTIGRAVITY_CONVERSATION_ID || loadSavedConversationId() || "";
 let activeModel = "gemini-3.8-flash-high";
+let serverPort = DEFAULT_PORT;
+let detectedBackendPort = null;
 
 function loadSavedConversationId() {
   try {
@@ -75,6 +80,67 @@ const MIME_TYPES = {
   ".txt": "text/plain; charset=utf-8",
 };
 
+// Candidate subdirectories containing index.html
+const CANDIDATE_SUBDIRS = ["", "web", "public", "dist", "client", "frontend", "app", "src", "www", "build", "out"];
+
+function findWebRoot(dir) {
+  for (const sub of CANDIDATE_SUBDIRS) {
+    const candidate = sub ? path.join(dir, sub) : dir;
+    const candidateIndex = path.join(candidate, "index.html");
+    if (fs.existsSync(candidateIndex) && !fs.statSync(candidateIndex).isDirectory()) {
+      return candidate;
+    }
+  }
+  return dir;
+}
+
+function probePort(port) {
+  return new Promise((resolve) => {
+    const req = http.get({
+      hostname: "127.0.0.1",
+      port,
+      path: "/",
+      timeout: 300
+    }, (res) => {
+      resolve(true);
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+async function detectBackendPort(projectDir, ownPort) {
+  if (process.env.LASSO_BACKEND_PORT) {
+    return parseInt(process.env.LASSO_BACKEND_PORT, 10);
+  }
+
+  // Check if project is termux-workspace or similar python app
+  if (fs.existsSync(path.join(projectDir, "server", "main.py"))) {
+    if (await probePort(8000)) return 8000;
+    if (await probePort(24817)) return 24817;
+
+    // If preview script exists but port is not up, try starting preview
+    const previewScript = path.join(projectDir, "preview.sh");
+    if (fs.existsSync(previewScript)) {
+      try {
+        execSync(`bash "${previewScript}" >/dev/null 2>&1`, { cwd: projectDir });
+        await new Promise(r => setTimeout(r, 600));
+        if (await probePort(8000)) return 8000;
+      } catch (_) {}
+    }
+  }
+
+  // Probe common dev server ports
+  const candidatePorts = [3000, 5173, 8000, 24817, 4000, 5000].filter(p => p !== ownPort);
+  for (const p of candidatePorts) {
+    if (await probePort(p)) return p;
+  }
+  return null;
+}
+
 // Available Antigravity models
 let cachedModels = null;
 function getAvailableModels() {
@@ -106,6 +172,33 @@ function getAvailableModels() {
     { id: "gpt-oss-120b-medium", label: "GPT-OSS 120B (Medium)", provider: "openai" }
   ];
   return cachedModels;
+}
+
+// Recursive file scanner for accurate project diffs
+function getProjectFiles(dir, maxDepth = 4) {
+  const files = [];
+  function scan(current, depth, prefix) {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch (_) {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "vendor" || entry.name === "__pycache__" || entry.name === "dist" || entry.name === "build") {
+        continue;
+      }
+      const relPath = prefix ? path.join(prefix, entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        scan(path.join(current, entry.name), depth + 1, relPath);
+      } else if (entry.isFile()) {
+        files.push(relPath);
+      }
+    }
+  }
+  scan(dir, 1, "");
+  return files;
 }
 
 // In-memory snapshots for safe Undo
@@ -152,79 +245,9 @@ function triggerReload() {
   }
 }
 
-// Create HTTP server
-function createServer() {
-  const server = http.createServer((req, res) => {
-    const rawUrl = req.url || "/";
-    const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
-    let pathname = decodeURIComponent(parsedUrl.pathname);
-
-    // Live reload SSE endpoint
-    if (pathname === "/__lasso/reload-events") {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      });
-      reloadClients.add(res);
-      req.on("close", () => reloadClients.delete(res));
-      return;
-    }
-
-    // Serve Lasso Overlay Bundle
-    if (pathname === "/__lasso/overlay.js") {
-      if (fs.existsSync(OVERLAY_FILE)) {
-        res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
-        res.end(fs.readFileSync(OVERLAY_FILE));
-      } else {
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end("Lasso overlay bundle not found.");
-      }
-      return;
-    }
-
-    // Status endpoint for health checks
-    if (pathname === "/__lasso/status") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        projectDir: activeProjectDir,
-        conversationId: activeConversationId,
-        model: activeModel,
-      }));
-      return;
-    }
-
-    // Resolve static file from activeProjectDir (e.g. ~/game)
-    let filePath = path.join(activeProjectDir, pathname);
-
-    // If directory, check index.html
-    if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
-      filePath = path.join(filePath, "index.html");
-    }
-
-    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-      // Fallback: check index.html in project root
-      const fallbackIndex = path.join(activeProjectDir, "index.html");
-      if (fs.existsSync(fallbackIndex)) {
-        filePath = fallbackIndex;
-      } else {
-        res.writeHead(404, { "Content-Type": "text/plain" });
-        res.end(`File not found: ${pathname} in ${activeProjectDir}`);
-        return;
-      }
-    }
-
-    const ext = path.extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext] || "application/octet-stream";
-
-    // If HTML: inject the Lasso Overlay & Live Reload script!
-    if (ext === ".html" || ext === ".htm") {
-      try {
-        let html = fs.readFileSync(filePath, "utf8");
-        const port = server.address() ? server.address().port : DEFAULT_PORT;
-        
-        const injection = `
+// Inject Lasso Overlay & Reload snippet into HTML string
+function injectLasso(html, port) {
+  const injection = `
 <!-- [Lasso Agent] Overlay & Live Reload Injection -->
 <script src="/__lasso/overlay.js?bridgePort=${port}"></script>
 <script>
@@ -241,38 +264,238 @@ function createServer() {
   })();
 </script>
 `;
+  if (html.includes("</head>")) {
+    return html.replace("</head>", `${injection}</head>`);
+  } else if (html.includes("</body>")) {
+    return html.replace("</body>", `${injection}</body>`);
+  } else {
+    return html + injection;
+  }
+}
 
-        if (html.includes("</head>")) {
-          html = html.replace("</head>", `${injection}</head>`);
-        } else if (html.includes("</body>")) {
-          html = html.replace("</body>", `${injection}</body>`);
-        } else {
-          html += injection;
-        }
+// HTTP Reverse Proxy to backend dev server
+function proxyHttpRequest(req, res, targetPort, injectOverlay = false) {
+  const options = {
+    hostname: "127.0.0.1",
+    port: targetPort,
+    path: req.url,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: `127.0.0.1:${targetPort}`,
+      origin: `http://127.0.0.1:${targetPort}`,
+      referer: `http://127.0.0.1:${targetPort}/`,
+    }
+  };
 
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(html);
-        return;
-      } catch (err) {
-        res.writeHead(500, { "Content-Type": "text/plain" });
-        res.end("Failed to read HTML: " + err.message);
-        return;
-      }
+  const proxyReq = http.request(options, (proxyRes) => {
+    const isHtml = (proxyRes.headers["content-type"] || "").includes("text/html");
+
+    if (injectOverlay && isHtml) {
+      let body = "";
+      proxyRes.on("data", chunk => body += chunk.toString("utf8"));
+      proxyRes.on("end", () => {
+        const injected = injectLasso(body, serverPort);
+        const headers = { ...proxyRes.headers };
+        headers["content-type"] = "text/html; charset=utf-8";
+        headers["content-length"] = Buffer.byteLength(injected, "utf8");
+        delete headers["content-encoding"];
+        res.writeHead(proxyRes.statusCode, headers);
+        res.end(injected);
+      });
+      return;
     }
 
-    // Serve other static assets (images, audio, js, css, etc.)
-    try {
-      const stream = fs.createReadStream(filePath);
-      res.writeHead(200, { "Content-Type": contentType });
-      stream.pipe(res);
-    } catch (err) {
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      res.end("Stream error: " + err.message);
-    }
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res, { end: true });
   });
 
-  // Attach WebSocket Bridge to the same HTTP server
-  const wss = new WebSocketServer({ server });
+  proxyReq.on("error", (err) => {
+    res.writeHead(502, { "Content-Type": "text/plain" });
+    res.end("Bad Gateway: Unable to reach backend dev server on port " + targetPort);
+  });
+
+  req.pipe(proxyReq, { end: true });
+}
+
+// WebSocket Reverse Proxy to backend server (e.g. termux-workspace terminal)
+function proxyWebSocket(req, clientSocket, head, targetPort) {
+  const targetSocket = net.connect(targetPort, "127.0.0.1", () => {
+    let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+    let hasOrigin = false;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const k = req.rawHeaders[i];
+      let v = req.rawHeaders[i + 1];
+      if (k.toLowerCase() === "host") v = `127.0.0.1:${targetPort}`;
+      if (k.toLowerCase() === "origin") {
+        v = `http://127.0.0.1:${targetPort}`;
+        hasOrigin = true;
+      }
+      raw += `${k}: ${v}\r\n`;
+    }
+    if (!hasOrigin) {
+      raw += `Origin: http://127.0.0.1:${targetPort}\r\n`;
+    }
+    raw += "\r\n";
+    targetSocket.write(raw);
+    if (head && head.length > 0) targetSocket.write(head);
+    targetSocket.pipe(clientSocket);
+    clientSocket.pipe(targetSocket);
+  });
+
+  targetSocket.on("error", () => clientSocket.destroy());
+  clientSocket.on("error", () => targetSocket.destroy());
+}
+
+// Request Handler for HTTP
+function handleHttpRequest(req, res, webRoot) {
+  const rawUrl = req.url || "/";
+  const parsedUrl = new URL(rawUrl, "http://127.0.0.1");
+  let pathname = decodeURIComponent(parsedUrl.pathname);
+
+  // Live reload SSE endpoint
+  if (pathname === "/__lasso/reload-events") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive"
+    });
+    reloadClients.add(res);
+    req.on("close", () => reloadClients.delete(res));
+    return;
+  }
+
+  // Serve Lasso Overlay Bundle
+  if (pathname === "/__lasso/overlay.js") {
+    if (fs.existsSync(OVERLAY_FILE)) {
+      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8" });
+      res.end(fs.readFileSync(OVERLAY_FILE));
+    } else {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Lasso overlay bundle not found.");
+    }
+    return;
+  }
+
+  // Status endpoint for health checks
+  if (pathname === "/__lasso/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok: true,
+      projectDir: activeProjectDir,
+      webRoot: webRoot,
+      backendPort: detectedBackendPort,
+      conversationId: activeConversationId,
+      model: activeModel,
+    }));
+    return;
+  }
+
+  // If path is an API endpoint and backend exists, proxy to backend
+  if ((pathname.startsWith("/api/") || pathname.startsWith("/ws/")) && detectedBackendPort) {
+    proxyHttpRequest(req, res, detectedBackendPort);
+    return;
+  }
+
+  // Resolve static file:
+  // 1. First look in webRoot (e.g. web/ or public/)
+  let filePath = path.join(webRoot, pathname);
+  if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+    filePath = path.join(filePath, "index.html");
+  }
+
+  // 2. If not found in webRoot, look in activeProjectDir root
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    const fallbackPath = path.join(activeProjectDir, pathname);
+    if (fs.existsSync(fallbackPath) && !fs.statSync(fallbackPath).isDirectory()) {
+      filePath = fallbackPath;
+    } else if (fs.existsSync(fallbackPath) && fs.statSync(fallbackPath).isDirectory()) {
+      const fallbackIndex = path.join(fallbackPath, "index.html");
+      if (fs.existsSync(fallbackIndex) && !fs.statSync(fallbackIndex).isDirectory()) {
+        filePath = fallbackIndex;
+      }
+    }
+  }
+
+  // 3. If still not found, check if backend port exists
+  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+    if (detectedBackendPort) {
+      proxyHttpRequest(req, res, detectedBackendPort, true);
+      return;
+    }
+
+    // Fallback: check index.html in webRoot for SPA client routing
+    const spaIndex = path.join(webRoot, "index.html");
+    if (fs.existsSync(spaIndex) && !fs.statSync(spaIndex).isDirectory()) {
+      filePath = spaIndex;
+    } else {
+      res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(`<html><body style="font-family:sans-serif;padding:2rem;background:#0d1117;color:#c9d1d9;">
+        <h2>Lasso Agent: No index.html found</h2>
+        <p>Could not find <code>index.html</code> in <code>${activeProjectDir}</code> or subdirectories (<code>web/</code>, <code>public/</code>, <code>dist/</code>).</p>
+        <p>Make sure your project has an <code>index.html</code> or start a development server on port 8000, 3000, or 5173.</p>
+      </body></html>`);
+      return;
+    }
+  }
+
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[ext] || "application/octet-stream";
+
+  // If HTML: inject the Lasso Overlay & Live Reload script!
+  if (ext === ".html" || ext === ".htm") {
+    try {
+      const html = fs.readFileSync(filePath, "utf8");
+      const injected = injectLasso(html, serverPort);
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(injected);
+      return;
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Failed to read HTML: " + err.message);
+      return;
+    }
+  }
+
+  // Serve other static assets (images, audio, js, css, etc.)
+  try {
+    const stream = fs.createReadStream(filePath);
+    res.writeHead(200, { "Content-Type": contentType });
+    stream.pipe(res);
+  } catch (err) {
+    res.writeHead(500, { "Content-Type": "text/plain" });
+    res.end("Stream error: " + err.message);
+  }
+}
+
+// Create HTTP server & WebSocket Bridge
+function createServer(webRoot) {
+  const server = http.createServer((req, res) => {
+    handleHttpRequest(req, res, webRoot);
+  });
+
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on("upgrade", (req, socket, head) => {
+    const parsedUrl = new URL(req.url || "/", "http://127.0.0.1");
+    const pathname = parsedUrl.pathname;
+
+    // Route Lasso bridge connections to wss
+    if (pathname === "/" || pathname.startsWith("/__lasso")) {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    // Route project backend WebSocket connections (e.g. /ws/terminal) to detected backend
+    if (detectedBackendPort) {
+      proxyWebSocket(req, socket, head, detectedBackendPort);
+      return;
+    }
+
+    socket.destroy();
+  });
 
   wss.on("connection", (ws) => {
     // Send configuration to overlay on connection
@@ -327,13 +550,7 @@ function createServer() {
         }));
 
         // Take pre-edit snapshot of all project files
-        const projectFiles = [];
-        try {
-          const files = fs.readdirSync(activeProjectDir);
-          for (const f of files) {
-            if (!f.startsWith(".") && f !== "node_modules") projectFiles.push(f);
-          }
-        } catch (_) {}
+        const projectFiles = getProjectFiles(activeProjectDir);
         const beforeSnaps = snapshotFiles(activeProjectDir, projectFiles);
         taskSnapshots.set(taskId, beforeSnaps);
 
@@ -399,7 +616,9 @@ function createServer() {
 
         child.on("close", () => {
           // Detect changes by comparing before and after files
-          const afterSnaps = snapshotFiles(activeProjectDir, projectFiles);
+          const afterFiles = getProjectFiles(activeProjectDir);
+          const allFiles = Array.from(new Set([...projectFiles, ...afterFiles]));
+          const afterSnaps = snapshotFiles(activeProjectDir, allFiles);
           const changes = [];
 
           for (const after of afterSnaps) {
@@ -451,7 +670,6 @@ function createServer() {
           taskId,
           message: "Changes applied successfully!",
         }));
-        // Auto reload game / page in browser!
         setTimeout(triggerReload, 300);
       }
 
@@ -478,8 +696,12 @@ function createServer() {
 }
 
 // Port probing & launch
-function startListening(port) {
-  const server = createServer();
+async function startListening(port) {
+  serverPort = port;
+  const webRoot = findWebRoot(activeProjectDir);
+  detectedBackendPort = await detectBackendPort(activeProjectDir, port);
+
+  const server = createServer(webRoot);
   server.once("error", (err) => {
     if (err.code === "EADDRINUSE") {
       console.log(`[Lasso Agent] Port ${port} is in use, trying ${port + 1}...`);
@@ -493,9 +715,21 @@ function startListening(port) {
   server.once("listening", () => {
     const address = server.address();
     const actualPort = typeof address === "object" ? address.port : port;
-    fs.writeFileSync(PID_FILE, JSON.stringify({ pid: process.pid, port: actualPort, startTime: Date.now(), projectDir: activeProjectDir }));
+    serverPort = actualPort;
+    fs.writeFileSync(PID_FILE, JSON.stringify({
+      pid: process.pid,
+      port: actualPort,
+      startTime: Date.now(),
+      projectDir: activeProjectDir,
+      webRoot,
+      backendPort: detectedBackendPort,
+    }));
     console.log(`[Lasso Agent] Serving project at http://127.0.0.1:${actualPort}`);
     console.log(`[Lasso Agent] Active Project: ${activeProjectDir}`);
+    console.log(`[Lasso Agent] Web Root: ${webRoot}`);
+    if (detectedBackendPort) {
+      console.log(`[Lasso Agent] Backend Dev Server Proxied: 127.0.0.1:${detectedBackendPort}`);
+    }
   });
 
   server.listen(port, "127.0.0.1");
