@@ -31,6 +31,66 @@ Select any part of your running app, describe what you want changed, and Lasso t
 
 ---
 
+# 🎯 Lasso Agent — Visual AI Code Editor for Google Antigravity
+
+> **Point at it. Describe it. Ship it.**  
+> Visual AI coding tool powered natively by **Google Antigravity**.
+
+Select any part of your running app, describe what you want changed, and let Antigravity edit the real source code with instant diff review and persistent multi-turn memory.
+
+---
+
+## ⚡ Instant One-Line Installation
+
+Run this single command in your terminal (Termux / Linux / macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xposa/lasso/main/install.sh | bash
+```
+
+This installs the **Lasso Agent Skill** directly into your Antigravity environment (`~/.gemini/config/skills/lasso-agent`).
+
+---
+
+## 🚀 How to Use
+
+### 1. Launch from Antigravity
+Inside your Antigravity CLI session (`agy`), type:
+
+```text
+/lasso-agent
+```
+
+Antigravity will automatically:
+* Start the local dashboard daemon on **`http://127.0.0.1:8080`** (with automatic collision fallback).
+* Connect directly to your active Antigravity session and multi-turn context memory.
+* Provide an interactive link to open the dashboard.
+
+### 2. Open the Web Dashboard
+Open your browser (e.g. Chrome on Android or desktop) and visit:  
+👉 **`http://127.0.0.1:8080`**
+
+### 3. Dashboard Features
+* 🎯 **Command Bar (⌘K / Prompt Input)**: Describe any feature, bug fix, or refactor.
+* ⚡ **Live Antigravity Streaming**: Stream reasoning and tool calls (*write_to_file*, *replace_file_content*, *run_command*) in real time.
+* 🧠 **Native Model Picker**: Toggle between Gemini 3.8 Flash (High), Claude Sonnet 4.6 (Thinking), Claude Opus 4.6, etc.
+* 🔍 **Review & Diff Panel**: Verify source code diffs with one-click **Accept** or **Revert**.
+* 🌐 **Live App Preview**: Embed your running local application (e.g. Vite on `3000` or Next.js) with Lasso visual selection.
+
+---
+
+## 💻 Optional Terminal Commands
+
+You can also manage the daemon directly from your command line:
+
+```bash
+lasso-agent start    # Start server in the background
+lasso-agent status   # Show running port and PID
+lasso-agent stop     # Terminate background server
+```
+
+---
+
 ## What is Lasso?
 
 Lasso is a **local-first visual coding tool**.
